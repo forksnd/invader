@@ -35,12 +35,12 @@
 const char *crc_spoof_modify_file_crc32(FakeFileHandle *f, uint64_t offset, uint32_t newcrc, bool printstatus);
 
 uint32_t get_crc32_and_length(FakeFileHandle *f, uint64_t *length);
-static void fseek64(FakeFileHandle f[static 1], uint64_t offset);
+static void fseek64(FakeFileHandle *f, uint64_t offset);
 uint32_t crc_spoof_reverse_bits(uint32_t x);
 
 static uint64_t multiply_mod(uint64_t x, uint64_t y);
 static uint64_t pow_mod(uint64_t x, uint64_t y);
-static void divide_and_remainder(uint64_t x, uint64_t y, uint64_t q[static 1], uint64_t r[static 1]);
+static void divide_and_remainder(uint64_t x, uint64_t y, uint64_t *q, uint64_t *r);
 static uint64_t reciprocal_mod(uint64_t x);
 static int get_degree(uint64_t x);
 
@@ -175,7 +175,7 @@ uint32_t get_crc32_and_length(FakeFileHandle *f, uint64_t *length) {
 }
 
 
-static void fseek64(FakeFileHandle f[static 1], uint64_t offset) {
+static void fseek64(FakeFileHandle *f, uint64_t offset) {
     crc_spoof_fake_rewind(f);
     while (offset > 0) {
         unsigned long n = LONG_MAX;
@@ -227,7 +227,7 @@ static uint64_t pow_mod(uint64_t x, uint64_t y) {
 
 
 // Computes polynomial x divided by polynomial y, returning the quotient and remainder.
-static void divide_and_remainder(uint64_t x, uint64_t y, uint64_t q[static 1], uint64_t r[static 1]) {
+static void divide_and_remainder(uint64_t x, uint64_t y, uint64_t *q, uint64_t *r) {
     if (y == 0) {
         fprintf(stderr, "Division by zero\n");
         exit(EXIT_FAILURE);
@@ -334,7 +334,7 @@ int crc_spoof_fake_feof(FakeFileHandle *f) {
 
 size_t crc_spoof_fake_fread(void *ptr, size_t size, size_t count, FakeFileHandle *f) {
     char *cptr = (char *)ptr;
-    size_t remaining_size = f->size - f->offset;
+    size_t remaining_size = (size_t)(f->size - f->offset);
     if(remaining_size < size * count) {
         count = remaining_size / size;
     }

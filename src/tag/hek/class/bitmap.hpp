@@ -13,10 +13,10 @@
 
 namespace Invader::HEK {
     enum BitmapDataType : TagEnum {
-        BITMAP_TYPE__2D_TEXTURE,
-        BITMAP_TYPE__3D_TEXTURE,
-        BITMAP_TYPE_CUBE_MAP,
-        BITMAP_TYPE_WHITE
+        BITMAP_DATA_TYPE_2D_TEXTURE,
+        BITMAP_DATA_TYPE_3D_TEXTURE,
+        BITMAP_DATA_TYPE_CUBE_MAP,
+        BITMAP_DATA_TYPE_WHITE
     };
 
     enum BitmapDataFormat : TagEnum {
@@ -75,21 +75,23 @@ namespace Invader::HEK {
         BITMAP_FORMAT_P8_BUMP
     };
 
+    const char *bitmap_data_format_name(BitmapDataFormat format);
+
     enum BitmapType : TagEnum {
-        BITMAP_TYPE_1__2D_TEXTURES,
-        BITMAP_TYPE_1__3D_TEXTURES,
-        BITMAP_TYPE_1_CUBE_MAPS,
-        BITMAP_TYPE_1_SPRITES,
-        BITMAP_TYPE_1_INTERFACE_BITMAPS
+        BITMAP_TYPE_2D_TEXTURES,
+        BITMAP_TYPE_3D_TEXTURES,
+        BITMAP_TYPE_CUBE_MAPS,
+        BITMAP_TYPE_SPRITES,
+        BITMAP_TYPE_INTERFACE_BITMAPS
     };
 
     enum BitmapFormat : TagEnum {
-        BITMAP_FORMAT_1_COMPRESSED_WITH_COLOR_KEY_TRANSPARENCY,
-        BITMAP_FORMAT_1_COMPRESSED_WITH_EXPLICIT_ALPHA,
-        BITMAP_FORMAT_1_COMPRESSED_WITH_INTERPOLATED_ALPHA,
-        BITMAP_FORMAT_1__16_BIT_COLOR,
-        BITMAP_FORMAT_1__32_BIT_COLOR,
-        BITMAP_FORMAT_1_MONOCHROME
+        BITMAP_FORMAT_COMPRESSED_WITH_COLOR_KEY_TRANSPARENCY,
+        BITMAP_FORMAT_COMPRESSED_WITH_EXPLICIT_ALPHA,
+        BITMAP_FORMAT_COMPRESSED_WITH_INTERPOLATED_ALPHA,
+        BITMAP_FORMAT_16_BIT_COLOR,
+        BITMAP_FORMAT_32_BIT_COLOR,
+        BITMAP_FORMAT_MONOCHROME
     };
 
     enum BitmapUsage : TagEnum {
@@ -102,11 +104,11 @@ namespace Invader::HEK {
     };
 
     enum BitmapSpriteBudgetSize : TagEnum {
-        BITMAP_SPRITE_BUDGET_SIZE__32X32,
-        BITMAP_SPRITE_BUDGET_SIZE__64X64,
-        BITMAP_SPRITE_BUDGET_SIZE__128X128,
-        BITMAP_SPRITE_BUDGET_SIZE__256X256,
-        BITMAP_SPRITE_BUDGET_SIZE__512X512
+        BITMAP_SPRITE_BUDGET_SIZE_32X32,
+        BITMAP_SPRITE_BUDGET_SIZE_64X64,
+        BITMAP_SPRITE_BUDGET_SIZE_128X128,
+        BITMAP_SPRITE_BUDGET_SIZE_256X256,
+        BITMAP_SPRITE_BUDGET_SIZE_512X512
     };
 
     enum BitmapSpriteUsage : TagEnum {
@@ -175,19 +177,19 @@ namespace Invader::HEK {
 
     ENDIAN_TEMPLATE(EndianType) struct BitmapData {
         EndianType<TagClassInt> bitmap_class;
-        EndianType<std::int16_t> width;
-        EndianType<std::int16_t> height;
-        EndianType<std::int16_t> depth;
+        EndianType<std::uint16_t> width;
+        EndianType<std::uint16_t> height;
+        EndianType<std::uint16_t> depth;
         EndianType<BitmapDataType> type;
         EndianType<BitmapDataFormat> format;
         EndianType<BitmapDataFlags> flags;
         Point2DInt<EndianType> registration_point;
-        EndianType<std::int16_t> mipmap_count;
+        EndianType<std::uint16_t> mipmap_count;
         PAD(0x2);
-        EndianType<std::int32_t> pixels_offset;
-        EndianType<std::int32_t> pixels_count;
+        EndianType<std::uint32_t> pixels_offset;
+        EndianType<std::uint32_t> pixels_count;
         EndianType<TagID> bitmap_tag_id;
-        EndianType<std::int32_t> pointer;
+        EndianType<Pointer> pointer;
         PAD(0x4);
         PAD(0x4);
 
@@ -259,7 +261,7 @@ namespace Invader::HEK {
         EndianType<BitmapSpriteUsage> sprite_usage;
 
         // 0x50
-        EndianType<std::int16_t> sprite_spacing;
+        EndianType<std::uint16_t> sprite_spacing;
         PAD(0x2);
         TagReflexive<EndianType, BitmapGroupSequence> bitmap_group_sequence;
         TagReflexive<EndianType, BitmapData> bitmap_data;

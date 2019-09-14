@@ -169,7 +169,7 @@ namespace Invader::HEK {
 
             auto node_rotation = quaternion_to_matrix(node.default_rotation);
             auto total_rotation = multiply_matrix(base_rotation, node_rotation);
-            node.matrix = total_rotation;
+            node.rotation = total_rotation;
 
             auto node_translation = multiply_vector(node.default_translation, -1.0);
             auto total_translation = rotate_vector(add_vector(node_translation, base_translation), node_rotation);
@@ -178,12 +178,12 @@ namespace Invader::HEK {
             recursion(node.next_sibling_node_index, base_rotation, base_translation, recursion);
             recursion(node.first_child_node_index, total_rotation, total_translation, recursion);
         };
-        Matrix<LittleEndian> no_rotation = {};
+        Matrix<LittleEndian> identity = {};
         for(int i = 0; i < 3; i++) {
-            no_rotation.matrix[i][i] = 1.0f;
+            identity.matrix[i][i] = 1.0f;
         }
         Vector3D<LittleEndian> no_translation = {};
-        write_node_data(0, no_rotation, no_translation, write_node_data);
+        write_node_data(0, identity, no_translation, write_node_data);
 
         // Make sure we don't have any stragglers
         for(std::size_t n = 0; n < nodes_count; n++) {
@@ -226,6 +226,9 @@ namespace Invader::HEK {
                 }
             } ADD_REFLEXIVE_END
         } ADD_REFLEXIVE_END
+
+        bool exodux_handler = false;
+        bool exodux_parser = false;
 
         ADD_REFLEXIVE_START(tag.geometries) {
             ADD_REFLEXIVE_START(reflexive.parts) {
@@ -308,7 +311,18 @@ namespace Invader::HEK {
 
                 INCREMENT_DATA_PTR(index_size);
 
+                // exodux compatibility bit
+                if(exodux_handler) {
+                    reflexive.bullshit = 0x43687521;
+                }
+                else {
+                    reflexive.bullshit = exodux_parser ? 0x52616921 : 0x56617021;
+                    exodux_parser = !exodux_parser;
+                }
+                exodux_handler = !exodux_handler;
+
                 reflexive.triangles.count = 0;
+
             } ADD_REFLEXIVE_END
         } ADD_REFLEXIVE_END
 

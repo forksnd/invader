@@ -8,6 +8,8 @@
 #include <cmath>
 #include <thread>
 
+#include "../resource/list/resource_list.hpp"
+
 #define BYTES_TO_MiB(bytes) ((bytes) / 1024.0 / 1024.0)
 
 // This is the maximum length. 255 crashes Guerilla, and anything higher will not be loaded.
@@ -16,6 +18,7 @@
 #include "../eprintf.hpp"
 #include "../tag/hek/class/biped.hpp"
 #include "../tag/hek/class/bitmap.hpp"
+#include "../tag/hek/class/detail_object_collection.hpp"
 #include "../tag/hek/class/fog.hpp"
 #include "../tag/hek/class/font.hpp"
 #include "../tag/hek/class/gbxmodel.hpp"
@@ -24,9 +27,11 @@
 #include "../tag/hek/class/scenario_structure_bsp.hpp"
 #include "../tag/hek/class/weather_particle_system.hpp"
 #include "../tag/hek/class/sound.hpp"
+#include "../tag/hek/class/string_list.hpp"
 #include "../version.hpp"
 #include "../error.hpp"
 #include "../hek/map.hpp"
+#include "../crc/hek/crc.hpp"
 
 #include "build_workload.hpp"
 
@@ -36,10 +41,14 @@ namespace Invader {
         std::vector<std::string> tags_directories,
         std::string maps_directory,
         const std::vector<std::tuple<HEK::TagClassInt, std::string>> &with_index,
-        bool indexed_tags,
-        bool verbose
+        bool no_indexed_tags,
+        bool always_index_tags,
+        bool verbose,
+        const std::uint32_t *forge_crc
     ) {
         BuildWorkload workload;
+
+        workload.always_index_tags = always_index_tags;
 
         // First set up indexed tags
         workload.compiled_tags.reserve(with_index.size());
@@ -75,7 +84,7 @@ namespace Invader {
         // Load resource maps if we need to do so
         workload.tags_directories = new_tag_dirs;
         workload.maps_directory = maps_directory;
-        if(indexed_tags && workload.maps_directory != "") {
+        if(!no_indexed_tags && workload.maps_directory != "") {
             // End with a directory separator if not already done so
             #ifdef _WIN32
             if(workload.maps_directory[workload.maps_directory.size() - 1] != '\\' || workload.maps_directory[workload.maps_directory.size() - 1] != '/') {
@@ -127,10 +136,10 @@ namespace Invader {
             }
         }
 
-        return workload.build_cache_file();
+        return workload.build_cache_file(forge_crc);
     }
 
-    std::vector<std::byte> BuildWorkload::build_cache_file() {
+    std::vector<std::byte> BuildWorkload::build_cache_file(const std::uint32_t *forge_crc) {
         using namespace HEK;
 
         // Get all the tags
@@ -148,7 +157,6 @@ namespace Invader {
         CacheFileHeader cache_file_header = {};
         std::vector<std::byte> file(sizeof(cache_file_header));
         std::strncpy(cache_file_header.name.string, get_scenario_name().data(), sizeof(cache_file_header.name.string) - 1);
-        std::strncpy(cache_file_header.build.string, INVADER_VERSION_STRING, sizeof(cache_file_header.build.string));
         cache_file_header.map_type = this->cache_file_type;
 
         // eXoDux-specific bit
@@ -161,8 +169,8 @@ namespace Invader {
         this->populate_tag_array(tag_data);
 
         // Fix the scenario tag
-        this->fix_scenario_tag_scripts();
         this->fix_scenario_tag_encounters();
+        this->fix_scenario_tag_command_lists();
 
         // Add tag data
         this->add_tag_data(tag_data, file);
@@ -299,9 +307,26 @@ namespace Invader {
         cache_file_header.tag_data_size = static_cast<std::uint32_t>(tag_data.size());
         cache_file_header.engine = CACHE_FILE_CUSTOM_EDITION;
         cache_file_header.file_size = 0; // do NOT set file size; this breaks Halo!
-        cache_file_header.crc32 = 0x7E706156;
-        std::snprintf(cache_file_header.build.string, sizeof(cache_file_header.build), "Invader " INVADER_VERSION_STRING);
+        std::snprintf(cache_file_header.build.string, sizeof(cache_file_header.build), INVADER_FULL_VERSION_STRING);
         std::copy(reinterpret_cast<std::byte *>(&cache_file_header), reinterpret_cast<std::byte *>(&cache_file_header + 1), file.data());
+
+        // Get the CRC and set it in the header
+        CacheFileHeader &cache_file_header_file = *reinterpret_cast<CacheFileHeader *>(file.data());
+        if(forge_crc) {
+            std::uint32_t new_random;
+            cache_file_header_file.crc32 = calculate_map_crc(file.data(), file.size(), forge_crc, &new_random);
+            CacheFileTagDataHeader &header = *reinterpret_cast<CacheFileTagDataHeader *>(file.data() + cache_file_header.tag_data_offset);
+            header.random_number = new_random;
+        }
+        else {
+            cache_file_header_file.crc32 = calculate_map_crc(file.data(), file.size());
+        }
+
+        #ifndef NO_OUTPUT
+        if(this->verbose) {
+            std::printf("CRC32 checksum:    0x%08X\n", cache_file_header_file.crc32.read());
+        }
+        #endif
 
         // Set eXoDux compatibility mode.
         if(x_dux) {
@@ -340,93 +365,173 @@ namespace Invader {
         // Get the amount of data removed
         std::size_t total_removed_data = 0;
 
-        for(auto &tag : this->compiled_tags) {
-            switch(tag->tag_class_int) {
-                case TagClassInt::TAG_CLASS_BITMAP:
-                    for(std::size_t b = 0; b < this->bitmaps.size(); b+=2) {
-                        if(this->bitmaps[b].data == tag->asset_data) {
-                            tag->indexed = true;
-                            tag->index = static_cast<std::uint32_t>(b + 1);
-                            tag->asset_data.clear();
-                            total_removed_data += this->bitmaps[b + 1].data.size();
-                            tag->data.clear();
-                            break;
+        // If we're always indexing tags when possible, match by path
+        if(this->always_index_tags) {
+            for(auto &tag : this->compiled_tags) {
+                switch(tag->tag_class_int) {
+                    case TagClassInt::TAG_CLASS_BITMAP:
+                        for(std::size_t b = 1; b < this->bitmaps.size(); b+=2) {
+                            if(this->bitmaps[b].name == tag->path) {
+                                total_removed_data += tag->data.size();
+                                tag->indexed = true;
+                                tag->index = static_cast<std::uint32_t>(b);
+                                tag->asset_data.clear();
+                                tag->data.clear();
+                                break;
+                            }
                         }
-                    }
-                    break;
-                case TagClassInt::TAG_CLASS_SOUND:
-                    for(std::size_t s = 0; s < this->sounds.size(); s+=2) {
-                        if(this->sounds[s].data == tag->asset_data && this->sounds[s].name == tag->path + "__permutations") {
-                            tag->indexed = true;
-                            tag->asset_data.clear();
-                            break;
+                        break;
+                    case TagClassInt::TAG_CLASS_SOUND:
+                        for(std::size_t s = 1; s < this->sounds.size(); s+=2) {
+                            if(this->sounds[s].name == tag->path) {
+                                tag->indexed = true;
+                                tag->asset_data.clear();
+                                break;
+                            }
                         }
-                    }
-                    break;
-                case TagClassInt::TAG_CLASS_FONT:
-                    for(std::size_t l = 0; l < this->loc.size(); l++) {
-                        auto &loc_tag = this->loc[l];
-                        if(loc_tag.name == tag->path) {
-                            auto *tag_font = reinterpret_cast<Font<LittleEndian> *>(tag->data.data());
-                            auto *loc_font = reinterpret_cast<Font<LittleEndian> *>(loc_tag.data.data());
+                        break;
+                    case TagClassInt::TAG_CLASS_FONT:
+                    case TagClassInt::TAG_CLASS_UNICODE_STRING_LIST:
+                    case TagClassInt::TAG_CLASS_HUD_MESSAGE_TEXT:
+                        for(std::size_t l = 0; l < this->loc.size(); l++) {
+                            if(this->loc[l].name == tag->path) {
+                                tag->indexed = true;
+                                tag->data.clear();
+                                tag->index = static_cast<std::uint32_t>(l);
+                                break;
+                            }
+                        }
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
 
-                            std::size_t tag_font_pixel_size = tag_font->pixels.size;
-                            std::size_t loc_font_pixel_size = loc_font->pixels.size;
+        // Otherwise, do this:
+        else {
+            for(auto &tag : this->compiled_tags) {
+                switch(tag->tag_class_int) {
+                    case TagClassInt::TAG_CLASS_BITMAP:
+                        for(std::size_t b = 0; b < this->bitmaps.size(); b+=2) {
+                            if(this->bitmaps[b].data == tag->asset_data) {
+                                tag->indexed = true;
+                                tag->index = static_cast<std::uint32_t>(b + 1);
+                                tag->asset_data.clear();
+                                total_removed_data += this->bitmaps[b + 1].data.size();
+                                tag->data.clear();
+                                break;
+                            }
+                        }
+                        break;
+                    case TagClassInt::TAG_CLASS_SOUND:
+                        for(std::size_t s = 0; s < this->sounds.size(); s+=2) {
+                            if(this->sounds[s].data == tag->asset_data && this->sounds[s].name == tag->path + "__permutations") {
+                                tag->indexed = true;
+                                tag->asset_data.clear();
+                                break;
+                            }
+                        }
+                        break;
+                    case TagClassInt::TAG_CLASS_FONT:
+                        for(std::size_t l = 0; l < this->loc.size(); l++) {
+                            auto &loc_tag = this->loc[l];
+                            if(loc_tag.name == tag->path) {
+                                auto *tag_font = reinterpret_cast<Font<LittleEndian> *>(tag->data.data());
+                                auto *loc_font = reinterpret_cast<Font<LittleEndian> *>(loc_tag.data.data());
 
-                            // Make sure the size is the same
-                            if(tag_font_pixel_size == loc_font_pixel_size) {
-                                std::size_t tag_font_pixels = tag->resolve_pointer(&tag_font->pixels.pointer);
-                                std::size_t loc_font_pixels = loc_font->pixels.pointer;
+                                std::size_t tag_font_pixel_size = tag_font->pixels.size;
+                                std::size_t loc_font_pixel_size = loc_font->pixels.size;
 
-                                // And make sure that the pointer in the loc tag points to something
-                                if(loc_font_pixels < loc_tag.data.size() && loc_font_pixels + loc_font_pixel_size <= loc_tag.data.size()) {
-                                    auto *tag_font_pixel_data = tag->data.data() + tag_font_pixels;
-                                    auto *loc_font_pixel_data = loc_tag.data.data() + loc_font_pixels;
+                                // Make sure the size is the same
+                                if(tag_font_pixel_size == loc_font_pixel_size) {
+                                    std::size_t tag_font_pixels = tag->resolve_pointer(&tag_font->pixels.pointer);
+                                    std::size_t loc_font_pixels = loc_font->pixels.pointer;
 
-                                    if(std::memcmp(tag_font_pixel_data, loc_font_pixel_data, tag_font_pixel_size) == 0) {
-                                        tag->index = static_cast<std::uint32_t>(l);
-                                        tag->indexed = true;
-                                        total_removed_data += loc_tag.data.size();
-                                        tag->data.clear();
+                                    // And make sure that the pointer in the loc tag points to something
+                                    if(loc_font_pixels < loc_tag.data.size() && loc_font_pixels + loc_font_pixel_size <= loc_tag.data.size()) {
+                                        auto *tag_font_pixel_data = tag->data.data() + tag_font_pixels;
+                                        auto *loc_font_pixel_data = loc_tag.data.data() + loc_font_pixels;
+
+                                        if(std::memcmp(tag_font_pixel_data, loc_font_pixel_data, tag_font_pixel_size) == 0) {
+                                            tag->index = static_cast<std::uint32_t>(l);
+                                            tag->indexed = true;
+                                            total_removed_data += loc_tag.data.size();
+                                            tag->data.clear();
+                                        }
                                     }
                                 }
-                            }
-                            break;
-                        }
-                    }
-                    break;
-                case TagClassInt::TAG_CLASS_UNICODE_STRING_LIST:
-                    for(std::size_t l = 0; l < this->loc.size(); l++) {
-                        auto &loc_tag = this->loc[l];
-                        if(loc_tag.name == tag->path) {
-                            // TODO: Compare strings.
-                            if(loc_tag.data.size() == tag->data.size()) {
-                                tag->index = static_cast<std::uint32_t>(l);
-                                tag->indexed = true;
-                                total_removed_data += loc_tag.data.size();
-                                tag->data.clear();
                                 break;
                             }
                         }
-                    }
-                    break;
-                case TagClassInt::TAG_CLASS_HUD_MESSAGE_TEXT:
-                    for(std::size_t l = 0; l < this->loc.size(); l++) {
-                        auto &loc_tag = this->loc[l];
-                        if(loc_tag.name == tag->path) {
-                            // TODO: Compare tag data.
-                            if(loc_tag.data.size() == tag->data.size()) {
-                                tag->index = static_cast<std::uint32_t>(l);
-                                tag->indexed = true;
-                                total_removed_data += loc_tag.data.size();
-                                tag->data.clear();
-                                break;
+                        break;
+                    case TagClassInt::TAG_CLASS_UNICODE_STRING_LIST:
+                        for(std::size_t l = 0; l < this->loc.size(); l++) {
+                            auto &loc_tag = this->loc[l];
+                            if(loc_tag.name == tag->path) {
+                                auto *tag_base = tag->data.data();
+                                auto *loc_base = loc_tag.data.data();
+
+                                auto *tag_list = reinterpret_cast<StringList<LittleEndian> *>(tag_base);
+                                auto *loc_list = reinterpret_cast<StringList<LittleEndian> *>(loc_base);
+                                std::uint32_t string_count = tag_list->strings.count.read();
+
+                                // First check if they have the same number of strings
+                                bool removed = false;
+                                if(loc_list->strings.count == string_count) {
+                                    // Next, iterate through each string and compare them
+                                    auto *tag_strings = reinterpret_cast<HEK::StringListString<LittleEndian> *>(tag_base + tag->resolve_pointer(&tag_list->strings.pointer));
+                                    auto *loc_strings = reinterpret_cast<HEK::StringListString<LittleEndian> *>(loc_base + loc_list->strings.pointer.read());
+
+                                    for(std::uint32_t s = 0; s < string_count; s++) {
+                                        auto *tag_str = reinterpret_cast<LittleEndian<std::uint16_t> *>(tag_base + tag->resolve_pointer(&tag_strings[s].string.pointer));
+                                        auto *loc_str = reinterpret_cast<LittleEndian<std::uint16_t> *>(loc_base + loc_strings[s].string.pointer.read());
+
+                                        // Iterate through each character until they aren't equal anymore or we hit a null byte
+                                        while(*tag_str != 0 && *loc_str != 0 && *tag_str == *loc_str) {
+                                            tag_str++;
+                                            loc_str++;
+                                        }
+
+                                        removed = *tag_str != *loc_str;
+                                        if(removed) {
+                                            break;
+                                        }
+                                    }
+                                }
+                                else {
+                                    removed = true;
+                                }
+
+                                // If we had to remove it, give up
+                                if(!removed) {
+                                    tag->index = static_cast<std::uint32_t>(l);
+                                    tag->indexed = true;
+                                    total_removed_data += loc_tag.data.size();
+                                    tag->data.clear();
+                                    break;
+                                }
                             }
                         }
-                    }
-                    break;
-                default:
-                    break;
+                        break;
+                    case TagClassInt::TAG_CLASS_HUD_MESSAGE_TEXT:
+                        for(std::size_t l = 0; l < this->loc.size(); l++) {
+                            auto &loc_tag = this->loc[l];
+                            if(loc_tag.name == tag->path) {
+                                // TODO: Compare tag data.
+                                if(loc_tag.data.size() == tag->data.size()) {
+                                    tag->index = static_cast<std::uint32_t>(l);
+                                    tag->indexed = true;
+                                    total_removed_data += loc_tag.data.size();
+                                    tag->data.clear();
+                                    break;
+                                }
+                            }
+                        }
+                        break;
+                    default:
+                        break;
+                }
             }
         }
 
@@ -438,6 +543,37 @@ namespace Invader {
 
         this->scenario_index = this->compile_tag_recursively(this->scenario.data(), TagClassInt::TAG_CLASS_SCENARIO);
         this->cache_file_type = reinterpret_cast<Scenario<LittleEndian> *>(this->compiled_tags[this->scenario_index]->data.data())->type;
+        auto scenario_name = this->get_scenario_name();
+
+        // Depending on the type of map we're building, use a certain resource limit
+        std::size_t bitmap_limit, sound_limit, loc_limit;
+
+        // Singleplayer / UI limits - use the internal list
+        if(this->cache_file_type != CacheFileType::CACHE_FILE_MULTIPLAYER) {
+            bitmap_limit = get_default_bitmap_resources_count();
+            sound_limit = get_default_sound_resources_count();
+            loc_limit = get_default_loc_resources_count();
+        }
+
+        // Multiplayer limits
+        else {
+            bitmap_limit = 853;
+            sound_limit = 376;
+            loc_limit = 176;
+        }
+
+        bitmap_limit *= 2;
+        sound_limit *= 2;
+
+        while(this->bitmaps.size() > bitmap_limit) {
+            this->bitmaps.erase(this->bitmaps.begin() + this->bitmaps.size() - 1);
+        }
+        while(this->sounds.size() > sound_limit) {
+            this->sounds.erase(this->sounds.begin() + this->sounds.size() - 1);
+        }
+        while(this->loc.size() > loc_limit) {
+            this->loc.erase(this->loc.begin() + this->loc.size() - 1);
+        }
 
         // We'll need to load these tags for all map types
         this->compile_tag_recursively("globals\\globals", TagClassInt::TAG_CLASS_GLOBALS);
@@ -474,7 +610,7 @@ namespace Invader {
                 // Damage effects and object tags that are not in the correct location will break things
                 #ifndef NO_OUTPUT
                 if(this->cache_file_type == CacheFileType::CACHE_FILE_MULTIPLAYER && (IS_OBJECT_TAG(compiled_tag->tag_class_int) || compiled_tag->tag_class_int == TagClassInt::TAG_CLASS_DAMAGE_EFFECT)) {
-                    eprintf("Warning: Network object %s.%s is missing.", compiled_tag->path.data(), tag_class_to_extension(compiled_tag->tag_class_int));
+                    eprintf("Warning: Network object %s.%s is missing.\n", compiled_tag->path.data(), tag_class_to_extension(compiled_tag->tag_class_int));
                     network_issue = true;
                 }
                 #endif
@@ -542,11 +678,55 @@ namespace Invader {
         #endif
 
         for(const auto &tag_dir : this->tags_directories) {
-            // Concatenate the tag path
-            std::string tag_path = tag_dir + tag_base_path;
-
             // Open the tag file
-            std::FILE *file = std::fopen(tag_path.data(), "rb");
+            std::FILE *file = nullptr;
+
+            // If it's not purely an object tag try to open it
+            if(tag_class_int != TagClassInt::TAG_CLASS_OBJECT) {
+                // Concatenate the tag path
+                std::string tag_path = tag_dir + tag_base_path;
+                file = std::fopen(tag_path.data(), "rb");
+            }
+            // Otherwise, see if we can go through the different object types
+            else {
+                auto attempt_to_open_tag = [&tag_dir, &path](TagClassInt class_int) -> std::FILE * {
+                    std::string tag_path = tag_dir + path + "." + tag_class_to_extension(class_int);
+                    #ifndef _WIN32
+                    for(char &c : tag_path) {
+                        if(c == '\\') {
+                            c = '/';
+                        }
+                    }
+                    #endif
+                    return std::fopen(tag_path.data(), "rb");
+                };
+                #define MAKE_ATTEMPT(class_int) if(file == nullptr) { file = attempt_to_open_tag(class_int); if(file) tag_class_int = class_int; }
+
+                std::string tag_path = tag_dir + tag_base_path;
+                MAKE_ATTEMPT(HEK::TagClassInt::TAG_CLASS_BIPED);
+                MAKE_ATTEMPT(HEK::TagClassInt::TAG_CLASS_DEVICE);
+                MAKE_ATTEMPT(HEK::TagClassInt::TAG_CLASS_DEVICE_CONTROL);
+                MAKE_ATTEMPT(HEK::TagClassInt::TAG_CLASS_DEVICE_LIGHT_FIXTURE);
+                MAKE_ATTEMPT(HEK::TagClassInt::TAG_CLASS_DEVICE_MACHINE);
+                MAKE_ATTEMPT(HEK::TagClassInt::TAG_CLASS_EQUIPMENT);
+                MAKE_ATTEMPT(HEK::TagClassInt::TAG_CLASS_GARBAGE);
+                MAKE_ATTEMPT(HEK::TagClassInt::TAG_CLASS_ITEM);
+                MAKE_ATTEMPT(HEK::TagClassInt::TAG_CLASS_OBJECT);
+                MAKE_ATTEMPT(HEK::TagClassInt::TAG_CLASS_PLACEHOLDER);
+                MAKE_ATTEMPT(HEK::TagClassInt::TAG_CLASS_PROJECTILE);
+                MAKE_ATTEMPT(HEK::TagClassInt::TAG_CLASS_SCENERY);
+                MAKE_ATTEMPT(HEK::TagClassInt::TAG_CLASS_SOUND_SCENERY);
+                MAKE_ATTEMPT(HEK::TagClassInt::TAG_CLASS_VEHICLE);
+                MAKE_ATTEMPT(HEK::TagClassInt::TAG_CLASS_WEAPON);
+
+                // If we successfully open it, try again
+                if(file) {
+                    std::fclose(file);
+                    return compile_tag_recursively(path, tag_class_int);
+                }
+            }
+
+            // Continue if we couldn't do it
             if(!file) {
                 continue;
             }
@@ -602,7 +782,7 @@ namespace Invader {
                                 }
 
                                 // Get yer values here. Get 'em while they're hot.
-                                float width_bitmap = 1.0F / std::fabs(sprite.left - sprite.right) / bitmap_dimensions[sprite.bitmap_index].first;
+                                float width_bitmap = 1.0F / std::fabs(sprite.right - sprite.left) / bitmap_dimensions[sprite.bitmap_index].first;
                                 float height_bitmap = 1.0F / std::fabs(sprite.bottom - sprite.top) / bitmap_dimensions[sprite.bitmap_index].second;
                                 float smallest = (width_bitmap < height_bitmap) ? width_bitmap : height_bitmap;
                                 if(pixel_size > smallest) {
@@ -635,12 +815,23 @@ namespace Invader {
 
                 // Iterate through all of the tags this tag references
                 for(auto &dependency : tag_ptr->dependencies) {
+                    // Older HEK tags may use .model references instead of .gbxmodel references. tool.exe changes them to .gbxmodel references.
                     if(dependency.tag_class_int == TagClassInt::TAG_CLASS_MODEL) {
                         dependency.tag_class_int = TagClassInt::TAG_CLASS_GBXMODEL;
                     }
-                    auto *dependency_in_tag = reinterpret_cast<TagDependency<LittleEndian> *>(tag_ptr->data.data() + dependency.offset);
-                    dependency_in_tag->tag_id = tag_id_from_index(this->compile_tag_recursively(dependency.path.data(), dependency.tag_class_int));
-                    dependency_in_tag->tag_class_int = dependency.tag_class_int;
+
+                    // Compile the tag
+                    TagID new_tag_id = tag_id_from_index(this->compile_tag_recursively(dependency.path.data(), dependency.tag_class_int));
+
+                    // Set the tag ID
+                    if(!dependency.tag_id_only) {
+                        auto *dependency_in_tag = reinterpret_cast<TagDependency<LittleEndian> *>(tag_ptr->data.data() + dependency.offset);
+                        dependency_in_tag->tag_id = new_tag_id;
+                        dependency_in_tag->tag_class_int = dependency.tag_class_int;
+                    }
+                    else {
+                        *reinterpret_cast<LittleEndian<TagID> *>(tag_ptr->data.data() + dependency.offset) = new_tag_id;
+                    }
                 }
 
                 // BSP-related things (need to set water plane stuff for fog)
@@ -695,6 +886,38 @@ namespace Invader {
                                 }
                             }
                         }
+                    }
+                }
+
+                // Detail-object collection things
+                else if(tag_ptr->tag_class_int == HEK::TagClassInt::TAG_CLASS_DETAIL_OBJECT_COLLECTION) {
+                    // Make sure we're referencing the right things
+                    auto &dobc = *reinterpret_cast<DetailObjectCollection<LittleEndian> *>(tag_ptr->data.data());
+                    if(dobc.sprite_plate.tag_id.read().is_null()) {
+                        eprintf("%s.detail_object_collection has no bitmap.\n", tag_ptr->path.data());
+                        throw;
+                    }
+                    auto &bitmap_tag = this->compiled_tags[dobc.sprite_plate.tag_id.read().index];
+                    if(bitmap_tag->tag_class_int != TagClassInt::TAG_CLASS_BITMAP) {
+                        eprintf("%s.detail_object_collection does not reference a bitmap.\n", tag_ptr->path.data());
+                        throw;
+                    }
+
+                    // Get bitmap data
+                    auto &bitmap = *reinterpret_cast<Bitmap<LittleEndian> *>(bitmap_tag->data.data());
+                    std::uint32_t sequences_count = bitmap.bitmap_group_sequence.count.read();
+                    auto *sequences = reinterpret_cast<BitmapGroupSequence<LittleEndian> *>(bitmap_tag->data.data() + bitmap_tag->resolve_pointer(&bitmap.bitmap_group_sequence.pointer));
+
+                    // Go through each thing
+                    std::uint32_t dobc_count = dobc.types.count.read();
+                    auto *dobc_type = reinterpret_cast<DetailObjectCollectionObjectType<LittleEndian> *>(tag_ptr->data.data() + tag_ptr->resolve_pointer(&dobc.types.pointer));
+                    for(std::uint32_t i = 0; i < dobc_count; i++) {
+                        std::uint8_t sequence_index = dobc_type[i].sequence_index;
+                        if(sequence_index >= sequences_count) {
+                            eprintf("Invalid sequence index %u / %u.\n", sequence_index, sequences_count);
+                            throw OutOfBoundsException();
+                        }
+                        dobc_type[i].sprite_count = static_cast<std::uint8_t>(sequences[sequence_index].sprites.count.read());
                     }
                 }
 
@@ -833,7 +1056,7 @@ namespace Invader {
                                 }
 
                                 // Set the decal count to the number of decals we used and add it to the end of the BSP
-                                bsp_data->runtime_decals.count = runtime_decals.size();
+                                bsp_data->runtime_decals.count = static_cast<std::uint32_t>(runtime_decals.size());
 
                                 if(runtime_decals.size() != 0) {
                                     std::size_t bsp_runtime_decal_offset = reinterpret_cast<std::byte *>(&bsp_data->runtime_decals.pointer) - bsp_tag->data.data();
@@ -1202,6 +1425,11 @@ namespace Invader {
 
         // Adjust for all dependencies
         for(auto &dependency : compiled_tag->dependencies) {
+            // Skip tag ID-only dependencies
+            if(dependency.tag_id_only) {
+                continue;
+            }
+
             if(dependency.offset + sizeof(TagDependency<LittleEndian>) > compiled_tag->data.size()) {
                 eprintf("Invalid dependency offset for %s.%s\n", compiled_tag->path.data(), tag_class_to_extension(compiled_tag->tag_class_int));
                 throw InvalidDependencyException();
@@ -1468,92 +1696,6 @@ namespace Invader {
     }
 
     #define TRANSLATE_SCENARIO_TAG_DATA_PTR(pointer) (scenario_tag_data + scenario_tag->resolve_pointer(&pointer))
-
-    void BuildWorkload::fix_scenario_tag_scripts() {
-        // Get the scenario tag
-        auto &scenario_tag = this->compiled_tags[this->scenario_index];
-        auto *scenario_tag_data = scenario_tag->data.data();
-        auto &scenario = *reinterpret_cast<HEK::Scenario<HEK::LittleEndian> *>(scenario_tag_data);
-
-        // Let's-a-go
-        auto *script_syntax_data = TRANSLATE_SCENARIO_TAG_DATA_PTR(scenario.script_syntax_data.pointer);
-        auto *script_string_data = reinterpret_cast<const char *>(TRANSLATE_SCENARIO_TAG_DATA_PTR(scenario.script_string_data.pointer));
-        auto &script_node_table = *reinterpret_cast<HEK::ScenarioScriptNodeTable<HEK::LittleEndian> *>(script_syntax_data);
-        auto *script_nodes = reinterpret_cast<HEK::ScenarioScriptNode<HEK::LittleEndian> *>(script_syntax_data + sizeof(script_node_table));
-        std::uint16_t count = script_node_table.size.read();
-
-        // Iterate through this
-        for(std::uint16_t c = 0; c < count; c++) {
-            // Check if we know the class
-            HEK::TagClassInt tag_class = HEK::TAG_CLASS_NONE;
-
-            switch(script_nodes[c].type.read()) {
-                case HEK::SCENARIO_SCRIPT_VALUE_TYPE_SOUND:
-                    tag_class = HEK::TAG_CLASS_SOUND;
-                    break;
-
-                case HEK::SCENARIO_SCRIPT_VALUE_TYPE_EFFECT:
-                    tag_class = HEK::TAG_CLASS_EFFECT;
-                    break;
-
-                case HEK::SCENARIO_SCRIPT_VALUE_TYPE_DAMAGE:
-                    tag_class = HEK::TAG_CLASS_DAMAGE_EFFECT;
-                    break;
-
-                case HEK::SCENARIO_SCRIPT_VALUE_TYPE_LOOPING_SOUND:
-                    tag_class = HEK::TAG_CLASS_SOUND_LOOPING;
-                    break;
-
-                case HEK::SCENARIO_SCRIPT_VALUE_TYPE_ANIMATION_GRAPH:
-                    tag_class = HEK::TAG_CLASS_MODEL_ANIMATIONS;
-                    break;
-
-                case HEK::SCENARIO_SCRIPT_VALUE_TYPE_ACTOR_VARIANT:
-                    tag_class = HEK::TAG_CLASS_ACTOR_VARIANT;
-                    break;
-
-                case HEK::SCENARIO_SCRIPT_VALUE_TYPE_DAMAGE_EFFECT:
-                    tag_class = HEK::TAG_CLASS_DAMAGE_EFFECT;
-                    break;
-
-                case HEK::SCENARIO_SCRIPT_VALUE_TYPE_OBJECT_DEFINITION:
-                    tag_class = HEK::TAG_CLASS_OBJECT;
-                    break;
-
-                default:
-                    continue;
-            }
-
-            if(tag_class != HEK::TAG_CLASS_NONE) {
-                // Check if we should leave it alone
-                auto flags = script_nodes[c].flags.read();
-                if(flags.is_global || flags.is_script_call) {
-                    continue;
-                }
-
-                // Get the string
-                bool found = false;
-                const char *string = script_string_data + script_nodes[c].string_offset.read();
-
-                // Get and write the tag ID
-                for(std::size_t t = 0; t < this->compiled_tags.size(); t++) {
-                    auto &tag = this->compiled_tags[t];
-                    if((tag->tag_class_int == tag_class || (tag_class == HEK::TAG_CLASS_OBJECT && IS_OBJECT_TAG(tag->tag_class_int))) && tag->path == string) {
-                        script_nodes[c].data = tag_id_from_index(t);
-                        found = true;
-                        break;
-                    }
-                }
-
-                // If we didn't find it, fail
-                if(!found) {
-                    eprintf("Cannot resolve script reference %s.%s\n", string, tag_class_to_extension(tag_class));
-                    throw;
-                }
-            }
-        }
-    }
-
     #define TRANSLATE_SBSP_TAG_DATA_PTR(pointer) (sbsp_tag_data + sbsp_tag->resolve_pointer(&pointer))
 
     void BuildWorkload::fix_scenario_tag_encounters() {
@@ -1568,9 +1710,34 @@ namespace Invader {
         auto *encounters = reinterpret_cast<HEK::ScenarioEncounter<HEK::LittleEndian> *>(TRANSLATE_SCENARIO_TAG_DATA_PTR(scenario.encounters.pointer));
         auto *encounters_end = encounters + encounters_count;
 
+        // Set some stuff up
+        static constexpr std::size_t VECTOR_SIZE = 65536;
+        auto clear_array = [](std::unique_ptr<std::uint8_t []> &arr) {
+            std::fill(arr.get(), arr.get() + VECTOR_SIZE, 0);
+        };
+        auto copy_array = [](const std::unique_ptr<std::uint8_t []> &from, std::unique_ptr<std::uint8_t []> &to) {
+            std::copy(from.get(), from.get() + VECTOR_SIZE, to.get());
+        };
+        auto set_flag_for_array = [](std::unique_ptr<std::uint8_t []> &arr, std::size_t offset, std::uint8_t flag) {
+            if(offset < VECTOR_SIZE) {
+                arr[offset] = flag;
+            }
+        };
+
+        // This is an array that holds 0's and 1's depending on a hit or miss. Best means the best for a given encounter. Current means for a given BSP.
+        // Ideally you want everything to be 1's up to the total count. 0 means it wasn't found in a BSP.
+        auto best_firing_position = std::make_unique<std::uint8_t []>(VECTOR_SIZE);
+        auto best_squad = std::make_unique<std::uint8_t []>(VECTOR_SIZE);
+        auto current_firing_position = std::make_unique<std::uint8_t []>(VECTOR_SIZE);
+        auto current_squad = std::make_unique<std::uint8_t []>(VECTOR_SIZE);
+
         // Iterate
         std::size_t warnings_given = 0;
         for(auto *encounter = encounters; encounter < encounters_end; encounter++) {
+            // Clear the best arrays
+            clear_array(best_firing_position);
+            clear_array(best_squad);
+
             // If the BSP index was manually specified, use that.
             if(encounter->flags.read().manual_bsp_index_specified) {
                 encounter->precomputed_bsp_index = encounter->manual_bsp_index;
@@ -1578,67 +1745,128 @@ namespace Invader {
             }
 
             // Highest number of hits in a BSP and current number of hits
-            std::size_t highest_count = 0;
-            std::size_t current_count = 0;
+            std::uint32_t highest_count = 0;
 
             // How many BSPs we've found the highest count
             std::uint32_t bsps_found_in = 0;
 
-            // Maximum number of hits
-            std::size_t max_hits = 0;
-
             // Get pointers
-            std::uint32_t squad_count = encounter->squads.count;
             auto *squads = reinterpret_cast<HEK::ScenarioSquad<HEK::LittleEndian> *>(TRANSLATE_SCENARIO_TAG_DATA_PTR(encounter->squads.pointer));
-            auto *squad_end = squads + squad_count;
-            std::uint32_t firing_position_count = encounter->firing_positions.count;
             auto *firing_positions = reinterpret_cast<HEK::ScenarioFiringPosition<HEK::LittleEndian> *>(TRANSLATE_SCENARIO_TAG_DATA_PTR(encounter->firing_positions.pointer));
-            auto *firing_position_end = firing_positions + firing_position_count;
+
+            std::uint32_t squad_max_hits = 0;
+            std::uint32_t squad_total = encounter->squads.count.read();
+            std::uint32_t firing_position_max_hits = 0;
+            std::uint32_t firing_position_total = encounter->firing_positions.count.read();
+            std::uint32_t max_hits = squad_total + firing_position_total;
+
+            float distance_to_ground_max = 0.0F;
+
+            // Hold onto this
+            bool three_dimensional_fire_positions = encounter->flags.read()._3d_firing_positions;
 
             // Begin counting and iterating through the BSPs
             for(std::uint32_t b = 0; b < sbsp_count; b++) {
-                current_count = 0;
+                // Clear the current arrays
+                clear_array(current_firing_position);
+                clear_array(current_squad);
 
                 // Don't check for stuff here if there's nothing to check
-                if(b > 0 && !max_hits) {
+                if(max_hits == 0) {
                     break;
                 }
 
                 // Check if the squad spawn positions are in the BSP
-                for(auto *squad = squads; squad < squad_end; squad++) {
-                    auto *spawn_point = reinterpret_cast<HEK::ScenarioActorStartingLocation<HEK::LittleEndian> *>(TRANSLATE_SCENARIO_TAG_DATA_PTR(squad->starting_locations.pointer));
-                    auto *spawn_point_end = spawn_point + squad->starting_locations.count.read();
+                std::uint32_t squad_count = 0;
 
+                const float MAX_DISTANCE = 2.0F;
+                float distance_to_ground = MAX_DISTANCE;
+                for(std::size_t s = 0; s < squad_total; s++) {
                     // Add 'em up
-                    for(auto *spawn = spawn_point; spawn < spawn_point_end; spawn++) {
-                        if(b == 0) {
-                            max_hits++;
+                    auto &squad = squads[s];
+
+                    // Have this here
+                    bool found = true;
+
+                    // Check spawn points
+                    auto *spawn_point_first = reinterpret_cast<HEK::ScenarioActorStartingLocation<HEK::LittleEndian> *>(TRANSLATE_SCENARIO_TAG_DATA_PTR(squad.starting_locations.pointer));
+                    auto *spawn_point_end = spawn_point_first + squad.starting_locations.count.read();
+                    for(auto *spawn_point = spawn_point_first; spawn_point < spawn_point_end && found; spawn_point++) {
+                        if(!this->point_in_bsp(b, spawn_point->position)) {
+                            found = false;
                         }
-                        if(this->point_in_bsp(b, spawn->position)) {
-                            current_count++;
+
+                        // If 3D firing positions is not set, find the distance to the ground.
+                        else if(!three_dimensional_fire_positions) {
+                            // Raycasting; Get two points: one at the point and one MAX_DISTANCE below it
+                            HEK::Point3D<HEK::LittleEndian> point = spawn_point->position;
+                            HEK::Point3D<HEK::LittleEndian> point_lower = spawn_point->position;
+                            point_lower.z = point.z - MAX_DISTANCE;
+
+                            // Use raycasting to get the distance to ground
+                            float q = MAX_DISTANCE;
+                            HEK::Point3D<HEK::LittleEndian> point_intersect;
+                            std::uint32_t surface_index, leaf_index;
+                            if(this->intersect_in_bsp(point, point_lower, b, point_intersect, surface_index, leaf_index)) {
+                                q = point.z - point_intersect.z;
+                            }
+                            else {
+                                found = false;
+                                break;
+                            }
+
+                            // If what we got is less than what we had before, narrow it down like that
+                            if(distance_to_ground > q) {
+                                distance_to_ground = q;
+                            }
                         }
+                    }
+
+                    if(found) {
+                        squad_count++;
+                        set_flag_for_array(current_squad, s, 1);
                     }
                 }
 
                 // Check if the firing positions are in the BSP
-                for(auto *firing_position = firing_positions; firing_position < firing_position_end; firing_position++) {
-                    if(b == 0) {
-                        max_hits++;
-                    }
-                    if(this->point_in_bsp(b, firing_position->position)) {
-                        current_count++;
+                std::uint32_t firing_position_count = 0;
+                for(std::size_t i = 0; i < firing_position_total; i++) {
+                    if(this->point_in_bsp(b, firing_positions[i].position)) {
+                        HEK::Point3D<HEK::LittleEndian> point = firing_positions[i].position;
+                        HEK::Point3D<HEK::LittleEndian> point_lower = firing_positions[i].position;
+                        point_lower.z = point.z - MAX_DISTANCE;
+
+                        HEK::Point3D<HEK::LittleEndian> point_intersect;
+                        std::uint32_t surface_index, leaf_index;
+
+                        if(three_dimensional_fire_positions || this->intersect_in_bsp(point, point_lower, b, point_intersect, surface_index, leaf_index)) {
+                            firing_position_count++;
+                            set_flag_for_array(current_firing_position, i, 1);
+                        }
                     }
                 }
 
                 // Check if we got something
+                std::uint32_t current_count = squad_count + firing_position_count;
                 if(current_count) {
                     if(current_count == highest_count) {
-                        bsps_found_in++;
+                        if(distance_to_ground == distance_to_ground_max) {
+                            bsps_found_in++;
+                        }
+                        else if(distance_to_ground < distance_to_ground_max) {
+                            bsps_found_in = 1;
+                            encounter->precomputed_bsp_index = static_cast<std::uint16_t>(b);
+                        }
                     }
                     else if(current_count > highest_count) {
                         encounter->precomputed_bsp_index = static_cast<std::uint16_t>(b);
                         bsps_found_in = 1;
                         highest_count = current_count;
+                        squad_max_hits = squad_count;
+                        firing_position_max_hits = firing_position_count;
+                        distance_to_ground_max = distance_to_ground;
+                        copy_array(current_firing_position, best_firing_position);
+                        copy_array(current_squad, best_squad);
                     }
                 }
             }
@@ -1647,37 +1875,201 @@ namespace Invader {
                 encounter->precomputed_bsp_index = static_cast<std::uint16_t>(0xFFFF);
             }
             else if(bsps_found_in > 1) {
-                eprintf("Warning: Encounter #%zu (%s) was found in %u BSPs (will place in #%u).\n", static_cast<std::size_t>(encounter - encounters), encounter->name.string, bsps_found_in, encounter->precomputed_bsp_index.read());
+                eprintf("Warning: Encounter #%zu (%s) was found in %u BSPs (will place in BSP #%u).\n", static_cast<std::size_t>(encounter - encounters), encounter->name.string, bsps_found_in, encounter->precomputed_bsp_index.read());
                 warnings_given++;
             }
             else if(bsps_found_in == 0) {
                 eprintf("Warning: Encounter #%zu (%s) was found in 0 BSPs.\n", static_cast<std::size_t>(encounter - encounters), encounter->name.string);
                 warnings_given++;
+                encounter->precomputed_bsp_index = static_cast<std::uint16_t>(0xFFFF);
             }
+
+            // Go through all the firing positions and set cluster stuff
+            std::uint16_t bsp = encounter->precomputed_bsp_index.read();
+            if(bsp != 0xFFFF && firing_position_total > 0) {
+                // Get leaves for the BSP
+                auto &sbsp_tag = this->compiled_tags[this->get_bsp_tag_index(bsp)];
+                auto *sbsp_tag_data = sbsp_tag->data.data();
+                auto &sbsp_tag_header = *reinterpret_cast<HEK::ScenarioStructureBSPCompiledHeader *>(sbsp_tag_data);
+                auto &sbsp = *reinterpret_cast<HEK::ScenarioStructureBSP<HEK::LittleEndian> *>(TRANSLATE_SBSP_TAG_DATA_PTR(sbsp_tag_header.pointer));
+
+                // Make sure we have a collision BSP
+                if(sbsp.collision_bsp.count != 1) {
+                    eprintf("BSP is missing a collision BSP.\n");
+                    throw OutOfBoundsException();
+                }
+                auto &collision_bsp = *reinterpret_cast<HEK::ModelCollisionGeometryBSP<HEK::LittleEndian> *>(TRANSLATE_SBSP_TAG_DATA_PTR(sbsp.collision_bsp.pointer));
+
+                // Leaves
+                auto *render_leaves = reinterpret_cast<HEK::ScenarioStructureBSPLeaf<HEK::LittleEndian> *>(TRANSLATE_SBSP_TAG_DATA_PTR(sbsp.leaves.pointer));
+                auto leaves_count = sbsp.leaves.count.read();
+                if(collision_bsp.leaves.count != leaves_count) {
+                    eprintf("BSP leaf count is not correct.\n");
+                    throw OutOfBoundsException();
+                }
+
+                for(std::uint32_t f = 0; f < firing_position_total; f++) {
+                    // Get a reference to the firing position
+                    auto &firing_position = firing_positions[f];
+
+                    // Get the leaf this point is located in
+                    auto leaf = this->leaf_for_point_in_bsp(bsp, firing_position.position);
+                    if(leaf.is_null()) {
+                        firing_position.cluster_index = 0xFFFF;
+                        continue;
+                    }
+
+                    // If it's 3D firing positions, then we can't get the surface index
+                    else if(three_dimensional_fire_positions) {
+                        firing_position.cluster_index = render_leaves[leaf.int_value()].cluster;
+                        firing_position.surface_index = ~0;
+                        continue;
+                    }
+
+                    if(leaves_count <= leaf) {
+                        eprintf("Invalid leaf index %u / %u in BSP.\n", leaf.int_value(), leaves_count);
+                        throw OutOfBoundsException();
+                    }
+
+                    // Intersect
+                    auto position_below = firing_position.position;
+                    position_below.z = position_below.z - 0.5F;
+
+                    HEK::Point3D<HEK::LittleEndian> intersection_point;
+                    std::uint32_t surface_index, leaf_index;
+                    if(intersect_in_bsp(firing_position.position, position_below, bsp, intersection_point, surface_index, leaf_index)) {
+                        firing_position.cluster_index = render_leaves[leaf_index].cluster;
+                        firing_position.surface_index = surface_index;
+                    }
+                }
+            }
+
+            if(max_hits > highest_count) {
+                eprintf("Warning: Encounter #%zu (%s) is partially outside of BSP #%u (%u / %u hits).\n", static_cast<std::size_t>(encounter - encounters), encounter->name.string, encounter->precomputed_bsp_index.read(), highest_count, max_hits);
+                warnings_given++;
+
+                // Show some information
+                auto print_info_for_encounter = [](const char *name, std::uint32_t max, std::uint32_t total, const std::unique_ptr<std::uint8_t []> &best) {
+                    char indices_list[256] = {};
+                    char *indices_list_offset = indices_list;
+                    char *indices_list_end = indices_list + sizeof(indices_list) - 1;
+                    int counted = 0;
+                    for(std::size_t i = 0; i < total && i < VECTOR_SIZE; i++) {
+                        if(!best.get()[i]) {
+                            if(counted == 5) {
+                                std::snprintf(indices_list_offset, indices_list_end - indices_list_offset, ", ...");
+                                break;
+                            }
+                            else {
+                                const char *comma = ", ";
+                                if(counted == 0) {
+                                    comma = "";
+                                }
+                                indices_list_offset += std::snprintf(indices_list_offset, indices_list_end - indices_list_offset, "%s%zu", comma, i);
+                                counted++;
+                            }
+                        }
+                    }
+                    char counter[16] = {};
+                    std::snprintf(counter, sizeof(counter), "%u/%u", max, total);
+                    eprintf("    %-20s Count: %-16s Indices: [%s]\n", name, counter, indices_list);
+                };
+
+                print_info_for_encounter("squads", squad_max_hits, squad_total, best_squad);
+                print_info_for_encounter("firing positions", firing_position_max_hits, firing_position_total, best_firing_position);
+            }
+        }
+
+        if(warnings_given) {
+            eprintf("Note: You can use manual BSP indices to silence %s.\n", warnings_given == 1 ? "this warning" : "these warnings");
         }
     }
 
-    bool BuildWorkload::point_in_bsp(std::uint32_t bsp, const HEK::Point3D<HEK::LittleEndian> &point) {
-        // Get current BSP
+    void BuildWorkload::fix_scenario_tag_command_lists() {
+        // Get the scenario tag and some BSP information
         auto &scenario_tag = this->compiled_tags[this->scenario_index];
         auto *scenario_tag_data = scenario_tag->data.data();
         auto &scenario = *reinterpret_cast<HEK::Scenario<HEK::LittleEndian> *>(scenario_tag_data);
-        auto *sbsps = reinterpret_cast<HEK::ScenarioBSP<HEK::LittleEndian> *>(TRANSLATE_SCENARIO_TAG_DATA_PTR(scenario.structure_bsps.pointer));
-        auto &sbsp_scenario_entry = sbsps[bsp];
-        auto sbsp_tag_id = sbsp_scenario_entry.structure_bsp.tag_id.read();
-        if(sbsp_tag_id.is_null()) {
-            return false;
+        std::uint32_t sbsp_count = scenario.structure_bsps.count;
+
+        // Get command lists
+        std::uint32_t command_lists_count = scenario.command_lists.count;
+        auto *command_lists = reinterpret_cast<HEK::ScenarioCommandList<HEK::LittleEndian> *>(TRANSLATE_SCENARIO_TAG_DATA_PTR(scenario.command_lists.pointer));
+
+        std::size_t warnings_given = 0;
+
+        // Iterate
+        for(std::uint32_t c = 0; c < command_lists_count; c++) {
+            auto &command_list = command_lists[c];
+
+            // If a manual BSP index is set or we risk dividing by 0, skip it
+            if(command_list.flags.read().manual_bsp_index) {
+                command_list.precomputed_bsp_index = command_list.manual_bsp_index;
+                continue;
+            }
+            if(command_list.points.count == 0) {
+                command_list.precomputed_bsp_index = ~static_cast<std::uint16_t>(0);
+                continue;
+            }
+
+            // Otherwise, let's begin
+            std::uint32_t points_count = command_list.points.count;
+            auto *points = reinterpret_cast<HEK::ScenarioCommandPoint<HEK::LittleEndian> *>(TRANSLATE_SCENARIO_TAG_DATA_PTR(command_list.points.pointer));
+            std::uint32_t points_found = 0;
+            std::uint32_t highest_bsp = 0;
+            std::uint32_t highest_bsp_count = 0;
+
+            for(std::uint32_t b = 0; b < sbsp_count; b++) {
+                std::uint32_t point_count_this_bsp = 0;
+                for(std::uint32_t p = 0; p < points_count; p++) {
+                    point_count_this_bsp += this->point_in_bsp(b, points[p].position);
+                }
+                if(point_count_this_bsp > 0) {
+                    if(points_found == point_count_this_bsp) {
+                        highest_bsp_count++;
+                    }
+                    else if(point_count_this_bsp > points_found) {
+                        highest_bsp = b;
+                        highest_bsp_count = 1;
+                        points_found = point_count_this_bsp;
+                    }
+                }
+            }
+
+            command_list.precomputed_bsp_index = highest_bsp;
+
+            if(highest_bsp_count == 0) {
+                eprintf("Warning: Command list #%u (%s) was found in 0 BSPs.\n", c, command_list.name.string);
+                warnings_given++;
+            }
+            else {
+                if(points_found < points_count) {
+                    eprintf("Warning: Command list #%u (%s) is partially outside of BSP #%u (%u / %u hits).\n", c, command_list.name.string, highest_bsp, points_found, points_count);
+                    warnings_given++;
+                }
+                else if(highest_bsp_count > 1) {
+                    eprintf("Warning: Command list #%u (%s) was found in %u BSPs (will place in BSP #%u).\n", c, command_list.name.string, highest_bsp_count, highest_bsp);
+                    warnings_given++;
+                }
+            }
         }
 
+        if(warnings_given) {
+            eprintf("Note: You can use manual BSP indices to silence %s.\n", warnings_given == 1 ? "this warning" : "these warnings");
+        }
+    }
+
+    HEK::FlaggedInt<std::uint32_t> BuildWorkload::leaf_for_point_in_bsp(std::uint32_t bsp, const HEK::Point3D<HEK::LittleEndian> &point) {
         // Get current BSP data
-        auto &sbsp_tag = this->compiled_tags[sbsp_tag_id.index];
+        auto &sbsp_tag = this->compiled_tags[this->get_bsp_tag_index(bsp)];
         auto *sbsp_tag_data = sbsp_tag->data.data();
         auto &sbsp_tag_header = *reinterpret_cast<HEK::ScenarioStructureBSPCompiledHeader *>(sbsp_tag_data);
         auto &sbsp = *reinterpret_cast<HEK::ScenarioStructureBSP<HEK::LittleEndian> *>(TRANSLATE_SBSP_TAG_DATA_PTR(sbsp_tag_header.pointer));
 
         // Make sure we have a collision BSP
-        if(sbsp.collision_bsp.count == 0) {
-            return false;
+        if(sbsp.collision_bsp.count != 1) {
+            eprintf("BSP is missing a collision BSP.\n");
+            throw OutOfBoundsException();
         }
         auto &collision_bsp = *reinterpret_cast<HEK::ModelCollisionGeometryBSP<HEK::LittleEndian> *>(TRANSLATE_SBSP_TAG_DATA_PTR(sbsp.collision_bsp.pointer));
 
@@ -1687,115 +2079,58 @@ namespace Invader {
         auto *planes = reinterpret_cast<HEK::ModelCollisionGeometryPlane<HEK::LittleEndian> *>(TRANSLATE_SBSP_TAG_DATA_PTR(collision_bsp.planes.pointer));
         auto planes_count = collision_bsp.planes.count.read();
 
-        // Get whether the point is in front of a 3D plane
-        auto point_in_front_of_plane = [&planes, &planes_count, &bsp](std::uint32_t plane_index, const HEK::Point3D<HEK::LittleEndian> &point) {
-            if(plane_index >= planes_count) {
-                eprintf("Invalid plane index %u / %u in BSP #%u.\n", plane_index, planes_count, bsp);
-                throw OutOfBoundsException();
-            }
-            return point.distance_from_plane(planes[plane_index].plane) >= 0;
-        };
+        return HEK::leaf_for_point_of_bsp_tree(point, bsp3d_nodes, bsp3d_nodes_count, planes, planes_count);
+    }
 
-        // Get leaves, nodes, and references
+    bool BuildWorkload::intersect_in_bsp(const HEK::Point3D<HEK::LittleEndian> &point_a, const HEK::Point3D<HEK::LittleEndian> &point_b, std::uint32_t bsp, HEK::Point3D<HEK::LittleEndian> &intersection_point, std::uint32_t &surface_index, std::uint32_t &leaf_index) {
+        auto &sbsp_tag = this->compiled_tags[this->get_bsp_tag_index(bsp)];
+        auto *sbsp_tag_data = sbsp_tag->data.data();
+        auto &sbsp_tag_header = *reinterpret_cast<HEK::ScenarioStructureBSPCompiledHeader *>(sbsp_tag_data);
+        auto &sbsp = *reinterpret_cast<HEK::ScenarioStructureBSP<HEK::LittleEndian> *>(TRANSLATE_SBSP_TAG_DATA_PTR(sbsp_tag_header.pointer));
+
+        auto &collision_bsp = *reinterpret_cast<HEK::ModelCollisionGeometryBSP<HEK::LittleEndian> *>(TRANSLATE_SBSP_TAG_DATA_PTR(sbsp.collision_bsp.pointer));
+        auto *bsp3d_nodes = reinterpret_cast<HEK::ModelCollisionGeometryBSP3DNode<HEK::LittleEndian> *>(TRANSLATE_SBSP_TAG_DATA_PTR(collision_bsp.bsp3d_nodes.pointer));
+        auto bsp3d_nodes_count = collision_bsp.bsp3d_nodes.count.read();
+        auto *planes = reinterpret_cast<HEK::ModelCollisionGeometryPlane<HEK::LittleEndian> *>(TRANSLATE_SBSP_TAG_DATA_PTR(collision_bsp.planes.pointer));
+        auto planes_count = collision_bsp.planes.count.read();
         auto *leaves = reinterpret_cast<HEK::ModelCollisionGeometryLeaf<HEK::LittleEndian> *>(TRANSLATE_SBSP_TAG_DATA_PTR(collision_bsp.leaves.pointer));
-        auto leaves_count = collision_bsp.leaves.count.read();
+        auto leaf_count = collision_bsp.leaves.count.read();
+        auto *bsp2d_nodes = reinterpret_cast<HEK::ModelCollisionGeometryBSP2DNode<HEK::LittleEndian> *>(TRANSLATE_SBSP_TAG_DATA_PTR(collision_bsp.bsp2d_nodes.pointer));
+        auto bsp2d_node_count = collision_bsp.bsp2d_nodes.count.read();
         auto *bsp2d_references = reinterpret_cast<HEK::ModelCollisionGeometryBSP2DReference<HEK::LittleEndian> *>(TRANSLATE_SBSP_TAG_DATA_PTR(collision_bsp.bsp2d_references.pointer));
-        auto bsp2d_references_count = collision_bsp.bsp2d_references.count.read();
+        auto bsp2d_reference_count = collision_bsp.bsp2d_references.count.read();
         auto *surfaces = reinterpret_cast<HEK::ModelCollisionGeometrySurface<HEK::LittleEndian> *>(TRANSLATE_SBSP_TAG_DATA_PTR(collision_bsp.surfaces.pointer));
-        auto surfaces_count = collision_bsp.surfaces.count.read();
+        auto surface_count = collision_bsp.surfaces.count.read();
+        auto *edges = reinterpret_cast<HEK::ModelCollisionGeometryEdge<HEK::LittleEndian> *>(TRANSLATE_SBSP_TAG_DATA_PTR(collision_bsp.edges.pointer));
+        auto edge_count = collision_bsp.edges.count.read();
+        auto *vertices = reinterpret_cast<HEK::ModelCollisionGeometryVertex<HEK::LittleEndian> *>(TRANSLATE_SBSP_TAG_DATA_PTR(collision_bsp.vertices.pointer));
+        auto vertex_count = collision_bsp.vertices.count.read();
 
-        auto point_in_leaf = [&leaves, &leaves_count, &bsp2d_references, &bsp2d_references_count, &surfaces, &surfaces_count, &point_in_front_of_plane, &bsp](std::uint32_t leaf_index, const HEK::Point3D<HEK::LittleEndian> &point) -> bool {
-            if(leaf_index >= leaves_count) {
-                eprintf("Invalid leaf index %u / %u in BSP #%u.\n", leaf_index, leaves_count, bsp);
-                throw OutOfBoundsException();
-            }
+        return check_for_intersection(point_a, point_b, bsp3d_nodes, bsp3d_nodes_count, planes, planes_count, leaves, leaf_count, bsp2d_nodes, bsp2d_node_count, bsp2d_references, bsp2d_reference_count, surfaces, surface_count, edges, edge_count, vertices, vertex_count, intersection_point, surface_index, leaf_index);
+    }
 
-            // Check if the references are bullshit
-            auto &leaf = leaves[leaf_index];
-            std::size_t reference_count = leaf.bsp2d_reference_count.read();
-            std::size_t first_reference_index = leaf.first_bsp2d_reference.read();
-            std::size_t end_reference_index = first_reference_index + reference_count;
+    bool BuildWorkload::point_in_bsp(std::uint32_t bsp, const HEK::Point3D<HEK::LittleEndian> &point) {
+        return !this->leaf_for_point_in_bsp(bsp, point).is_null();
+    }
 
-            // Check if the count is not 0
-            if(reference_count != 0) {
-                if((first_reference_index >= bsp2d_references_count || end_reference_index > bsp2d_references_count)) {
-                    eprintf("Invalid BSP2D reference range %zu-%zu / %u\n", first_reference_index, end_reference_index, bsp2d_references_count);
-                    throw OutOfBoundsException();
-                }
+    std::size_t BuildWorkload::get_bsp_tag_index(std::uint32_t bsp) {
+        auto &scenario_tag = this->compiled_tags[this->scenario_index];
+        auto *scenario_tag_data = scenario_tag->data.data();
+        auto &scenario = *reinterpret_cast<HEK::Scenario<HEK::LittleEndian> *>(scenario_tag_data);
+        auto *sbsps = reinterpret_cast<HEK::ScenarioBSP<HEK::LittleEndian> *>(TRANSLATE_SCENARIO_TAG_DATA_PTR(scenario.structure_bsps.pointer));
 
-                // Iterate through BSP2D references
-                auto *first_reference = bsp2d_references + first_reference_index;
-                auto *end_reference = bsp2d_references + end_reference_index;
+        // Invalid BSP?
+        if(scenario.structure_bsps.count <= bsp) {
+            throw OutOfBoundsException();
+        }
 
-                for(auto *reference = first_reference; reference < end_reference; reference++) {
-                    auto plane = reference->plane.read();
-                    auto node2d = reference->bsp2d_node.read();
+        // Do it
+        auto &sbsp_scenario_entry = sbsps[bsp];
+        auto sbsp_tag = sbsp_scenario_entry.structure_bsp.tag_id.read().index;
+        if(sbsp_tag >= this->tag_count) {
+            throw OutOfBoundsException();
+        }
 
-                    if(node2d.flag) {
-                        if(node2d.index >= surfaces_count) {
-                            eprintf("Invalid surface %u / %u in BSP #%u.\n", node2d.index, surfaces_count, bsp);
-                            throw OutOfBoundsException();
-                        }
-
-                        if(!surfaces[node2d.index].plane.read().flag && !point_in_front_of_plane(surfaces[node2d.index].plane.read(), point)) {
-                            return false;
-                        }
-                    }
-                    else if(!point_in_front_of_plane(plane, point)) {
-                        return false;
-                    }
-                }
-            }
-
-            return true;
-        };
-
-        auto point_in_3d_tree = [&bsp3d_nodes, &bsp3d_nodes_count, &point_in_front_of_plane, &point_in_leaf, &bsp](std::uint32_t node_index, const HEK::Point3D<HEK::LittleEndian> &point, auto &point_in_tree_recursion) -> bool {
-            while(true) {
-                if(node_index >= bsp3d_nodes_count) {
-                    eprintf("Invalid BSP2D node %u / %u in BSP #%u.\n", node_index, bsp3d_nodes_count, bsp);
-                    throw OutOfBoundsException();
-                }
-
-                // Get the node as well as front/back child info
-                auto &node = bsp3d_nodes[node_index];
-                auto front_child = node.front_child.read();
-                auto back_child = node.back_child.read();
-
-                // Let's see if it's in front of the plane
-                if(point_in_front_of_plane(node.plane, point)) {
-                    // Stop at null
-                    if(front_child.is_null()) {
-                        return true;
-                    }
-
-                    // Stop at leaf
-                    if(front_child.flag) {
-                        return point_in_leaf(front_child.index, point);
-                    }
-
-                    // Or try its front child
-                    else {
-                        return point_in_tree_recursion(front_child.index, point, point_in_tree_recursion);
-                    }
-                }
-
-                // If it's not, let's keep going
-                // First, is the back child null? If so, there's nowhere to go.
-                if(back_child.is_null()) {
-                    return false;
-                }
-
-                // If it's a leaf, well... give it a shot
-                if(back_child.flag) {
-                    return point_in_leaf(back_child.index, point);
-                }
-
-                // Lastly, let's see if we can continue traversing
-                node_index = back_child.index;
-            }
-        };
-
-        return point_in_3d_tree(0, point, point_in_3d_tree);
+        return sbsp_tag;
     }
 }

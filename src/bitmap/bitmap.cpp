@@ -1,53 +1,45 @@
+/*
+ * Invader (c) 2018 Kavawuvi
+ *
+ * This program is free software under the GNU General Public License v3.0 or later. See LICENSE for more information.
+ */
+
 #include <getopt.h>
 #include <zlib.h>
 #include <filesystem>
+#include <optional>
 #include <tiffio.h>
-#include <png.h>
 
+#define STB_DXT_USE_ROUNDING_BIAS
+#include "stb/stb_dxt.h"
+#include "stb/stb_image.h"
 #include "../eprintf.hpp"
 #include "../version.hpp"
 #include "../tag/hek/class/bitmap.hpp"
-#include "composite_bitmap.hpp"
+#include "color_plate_scanner.hpp"
 
-static Invader::CompositeBitmapPixel *load_tiff(const char *path, std::uint32_t &image_width, std::uint32_t &image_height, std::size_t &image_size);
-static Invader::CompositeBitmapPixel *load_png(const char *path, std::uint32_t &image_width, std::uint32_t &image_height, std::size_t &image_size);
+enum SUPPORTED_FORMATS_INT {
+    SUPPORTED_FORMATS_TIF = 0,
+    SUPPORTED_FORMATS_TIFF,
+    SUPPORTED_FORMATS_PNG,
+    SUPPORTED_FORMATS_TGA,
+    SUPPORTED_FORMATS_BMP,
 
-enum MipmapScaleType {
-    /** Guess based on what the tag says */
-    MIPMAP_SCALE_TYPE_TAG,
-
-    /** Interpolate colors */
-    MIPMAP_SCALE_TYPE_LINEAR,
-
-    /** Interpolate RGB only */
-    MIPMAP_SCALE_TYPE_NEAREST_ALPHA,
-
-    /** Do not interpolate colors */
-    MIPMAP_SCALE_TYPE_NEAREST,
-
-    /** No mipmap */
-    MIPMAP_SCALE_TYPE_NONE
+    SUPPORTED_FORMATS_INT_COUNT
 };
 
-enum BitmapFormatType {
-    /** Guess based on what the tag says */
-    BITMAP_FORMAT_TYPE_TAG,
-
-    /** 32-bit uncompressed */
-    BITMAP_FORMAT_TYPE_32_BIT,
-
-    /** 16-bit uncompressed */
-    BITMAP_FORMAT_TYPE_16_BIT,
-
-    /** DXT1 compression */
-    BITMAP_FORMAT_TYPE_DXT1,
-
-    /** DXT3 compression */
-    BITMAP_FORMAT_TYPE_DXT3,
-
-    /** DXT5 compression */
-    BITMAP_FORMAT_TYPE_DXT5
+static const char *SUPPORTED_FORMATS[] = {
+    ".tif",
+    ".tiff",
+    ".png",
+    ".tga",
+    ".bmp"
 };
+
+static_assert(sizeof(SUPPORTED_FORMATS) / sizeof(*SUPPORTED_FORMATS) == SUPPORTED_FORMATS_INT_COUNT);
+
+static Invader::ColorPlatePixel *load_tiff(const char *path, std::uint32_t &image_width, std::uint32_t &image_height, std::size_t &image_size);
+static Invader::ColorPlatePixel *load_image(const char *path, std::uint32_t &image_width, std::uint32_t &image_height, std::size_t &image_size);
 
 int main(int argc, char *argv[]) {
     using namespace Invader::HEK;
@@ -60,35 +52,55 @@ int main(int argc, char *argv[]) {
     // Tags directory
     const char *tags = "tags/";
 
-    // Input type
-    const char *input_type = "tif";
-
     // Scale type?
-    MipmapScaleType mipmap_scale_type = MipmapScaleType::MIPMAP_SCALE_TYPE_TAG;
+    std::optional<ScannedColorMipmapType> mipmap_scale_type;
 
     // Format?
-    BitmapFormatType format = BitmapFormatType::BITMAP_FORMAT_TYPE_32_BIT;
+    std::optional<BitmapFormat> format;
 
     // Mipmap fade factor
-    float mipmap_fade = -1.0F;
+    std::optional<float> mipmap_fade;
+
+    // Bitmap type
+    std::optional<BitmapType> bitmap_type;
+
+    // Sprite parameters
+    std::optional<BitmapSpriteUsage> sprite_usage;
+    std::optional<std::uint32_t> sprite_budget;
+    std::optional<std::uint32_t> sprite_budget_count;
+    std::optional<std::uint32_t> sprite_spacing;
+
+    // Dithering?
+    bool dithering = false;
+
+    // Generate this many mipmaps
+    std::optional<std::uint16_t> max_mipmap_count;
+
+    // Ignore the tag data?
+    bool ignore_tag_data = false;
 
     // Long options
     int longindex = 0;
     static struct option options[] = {
         {"info",  no_argument, 0, 'i'},
+        {"ignore-tag",  no_argument, 0, 'I'},
         {"help",  no_argument, 0, 'h'},
+        {"dithering",  no_argument, 0, 'D'},
         {"data",  required_argument, 0, 'd' },
         {"tags",  required_argument, 0, 't' },
-        {"format", required_argument, 0, 'f' },
-        {"input-format", required_argument, 0, 'I' },
-        {"output-format", required_argument, 0, 'O' },
+        {"format", required_argument, 0, 'F' },
+        {"type", required_argument, 0, 'T' },
+        {"mipmap-count", required_argument, 0, 'm' },
         {"mipmap-fade", required_argument, 0, 'f' },
         {"mipmap-scale", required_argument, 0, 's' },
+        {"budget", required_argument, 0, 'B' },
+        {"budget-count", required_argument, 0, 'C' },
+        {"spacing", required_argument, 0, 'S' },
         {0, 0, 0, 0 }
     };
 
     // Go through each argument
-    while((opt = getopt_long(argc, argv, "ihd:t:f:I:s:f:O:", options, &longindex)) != -1) {
+    while((opt = getopt_long(argc, argv, "DiIhd:t:f:s:f:F:m:T:S:B:C:", options, &longindex)) != -1) {
         switch(opt) {
             case 'd':
                 data = optarg;
@@ -98,13 +110,13 @@ int main(int argc, char *argv[]) {
                 tags = optarg;
                 break;
 
-            case 'I':
-                input_type = optarg;
-                break;
-
             case 'i':
                 INVADER_SHOW_INFO
                 return EXIT_FAILURE;
+
+            case 'I':
+                ignore_tag_data = true;
+                break;
 
             case 'f':
                 mipmap_fade = std::strtof(optarg, nullptr);
@@ -116,16 +128,13 @@ int main(int argc, char *argv[]) {
 
             case 's':
                 if(std::strcmp(optarg, "linear") == 0) {
-                    mipmap_scale_type = MipmapScaleType::MIPMAP_SCALE_TYPE_LINEAR;
+                    mipmap_scale_type = ScannedColorMipmapType::SCANNED_COLOR_MIPMAP_LINEAR;
                 }
                 else if(std::strcmp(optarg, "nearest") == 0) {
-                    mipmap_scale_type = MipmapScaleType::MIPMAP_SCALE_TYPE_NEAREST;
+                    mipmap_scale_type = ScannedColorMipmapType::SCANNED_COLOR_MIPMAP_NEAREST_ALPHA_COLOR;
                 }
                 else if(std::strcmp(optarg, "nearest-alpha") == 0) {
-                    mipmap_scale_type = MipmapScaleType::MIPMAP_SCALE_TYPE_NEAREST_ALPHA;
-                }
-                else if(std::strcmp(optarg, "none") == 0) {
-                    mipmap_scale_type = MipmapScaleType::MIPMAP_SCALE_TYPE_NONE;
+                    mipmap_scale_type = ScannedColorMipmapType::SCANNED_COLOR_MIPMAP_NEAREST_ALPHA;
                 }
                 else {
                     eprintf("Unknown mipmap scale type %s\n", optarg);
@@ -133,22 +142,71 @@ int main(int argc, char *argv[]) {
                 }
                 break;
 
-            case 'O':
+            case 'F':
                 if(std::strcmp(optarg, "32-bit") == 0) {
-                    format = BitmapFormatType::BITMAP_FORMAT_TYPE_32_BIT;
+                    format = BitmapFormat::BITMAP_FORMAT_32_BIT_COLOR;
                 }
                 else if(std::strcmp(optarg, "16-bit") == 0) {
-                    format = BitmapFormatType::BITMAP_FORMAT_TYPE_16_BIT;
+                    format = BitmapFormat::BITMAP_FORMAT_16_BIT_COLOR;
+                }
+                else if(std::strcmp(optarg, "monochrome") == 0) {
+                    format = BitmapFormat::BITMAP_FORMAT_MONOCHROME;
                 }
                 else if(std::strcmp(optarg, "dxt5") == 0) {
-                    format = BitmapFormatType::BITMAP_FORMAT_TYPE_DXT5;
+                    format = BitmapFormat::BITMAP_FORMAT_COMPRESSED_WITH_INTERPOLATED_ALPHA;
                 }
                 else if(std::strcmp(optarg, "dxt3") == 0) {
-                    format = BitmapFormatType::BITMAP_FORMAT_TYPE_DXT3;
+                    format = BitmapFormat::BITMAP_FORMAT_COMPRESSED_WITH_EXPLICIT_ALPHA;
                 }
                 else if(std::strcmp(optarg, "dxt1") == 0) {
-                    format = BitmapFormatType::BITMAP_FORMAT_TYPE_DXT1;
+                    format = BitmapFormat::BITMAP_FORMAT_COMPRESSED_WITH_COLOR_KEY_TRANSPARENCY;
                 }
+                else {
+                    eprintf("Unknown format %s\n", optarg);
+                    return EXIT_FAILURE;
+                }
+                break;
+
+            case 'T':
+                if(std::strcmp(optarg, "2d") == 0) {
+                    bitmap_type = BitmapType::BITMAP_TYPE_2D_TEXTURES;
+                }
+                else if(std::strcmp(optarg, "3d") == 0) {
+                    bitmap_type = BitmapType::BITMAP_TYPE_3D_TEXTURES;
+                }
+                else if(std::strcmp(optarg, "cubemap") == 0) {
+                    bitmap_type = BitmapType::BITMAP_TYPE_CUBE_MAPS;
+                }
+                else if(std::strcmp(optarg, "interface") == 0) {
+                    bitmap_type = BitmapType::BITMAP_TYPE_INTERFACE_BITMAPS;
+                }
+                else if(std::strcmp(optarg, "sprite") == 0) {
+                    bitmap_type = BitmapType::BITMAP_TYPE_SPRITES;
+                }
+                else {
+                    eprintf("Unknown type %s\n", optarg);
+                    return EXIT_FAILURE;
+                }
+                break;
+
+            case 'D':
+                dithering = true;
+                break;
+
+            case 'm':
+                max_mipmap_count = static_cast<std::int32_t>(std::strtol(optarg, nullptr, 10));
+                break;
+
+            case 'C':
+                sprite_budget_count = static_cast<std::uint32_t>(std::strtoul(optarg, nullptr, 10));
+                break;
+
+            case 'B':
+                sprite_budget = static_cast<std::uint32_t>(std::strtoul(optarg, nullptr, 10));
+                break;
+
+            case 'S':
+                sprite_spacing = static_cast<std::uint32_t>(std::strtoul(optarg, nullptr, 10));
                 break;
 
             default:
@@ -161,12 +219,23 @@ int main(int argc, char *argv[]) {
                 eprintf("    --data,-d <path>           Set the data directory.\n");
                 eprintf("    --tags,-t <path>           Set the tags directory.\n\n");
                 eprintf("Bitmap options:\n");
-                eprintf("    --output-format,-O <type>  Output format. Can be: 32-bit or 16-bit.\n");
-                eprintf("                               Default (new tag): 32-bit\n");
-                eprintf("    --input-format,-I <type>   Input format. Can be: tif or png. Default: tif\n");
+                eprintf("    --type,-T                  Set the type of bitmap. Can be: 2d, 3d, cubemap,\n");
+                eprintf("                               interface, sprite. Default (new tag): 2d\n");
+                eprintf("    --dithering,-D             Apply dithering. Only works on dxtn for now.\n");
+                eprintf("    --ignore-tag,-I            Ignore the tag data if the tag exists.\n");
+                eprintf("    --format,-F <type>         Pixel format. Can be: 32-bit, 16-bit, monochrome,\n");
+                eprintf("                               dxt5, dxt3, or dxt1. Default (new tag): 32-bit\n");
+                eprintf("    --mipmap-count,-m <count>  Set maximum mipmaps. Default (new tag): 32767\n");
                 eprintf("    --mipmap-fade,-f <factor>  Set detail fade factor. Default (new tag): 0.0\n");
                 eprintf("    --mipmap-scale,-s <type>   Mipmap scale type. Can be: linear, nearest-alpha,\n");
-                eprintf("                               nearest, none. Default (new tag): linear\n");
+                eprintf("                               nearest. Default (new tag): linear\n\n");
+                eprintf("Sprite options (only applies to sprite bitmaps):\n");
+                eprintf("    --spacing,-S <px>          Set the minimum spacing between sprites in\n");
+                eprintf("                               pixels. Default (new tag): 4\n");
+                eprintf("    --budget-count,-C <count>  Set maximum number of sprite sheets. Setting this\n");
+                eprintf("                               to 0 disables budgeting. Default (new tag): 0\n");
+                eprintf("    --budget,-B <length>       Set max length of sprite sheet. Values greater\n");
+                eprintf("                               than 512 aren't recorded. Default (new tag): 32\n");
 
                 return EXIT_FAILURE;
         }
@@ -180,32 +249,156 @@ int main(int argc, char *argv[]) {
     std::string bitmap_tag = argv[argc - 1];
     std::filesystem::path data_path = data;
 
+    // Get the path
+    std::filesystem::path tags_path(tags);
+    auto tag_path = tags_path / bitmap_tag;
+    auto final_path = tag_path.string() + ".bitmap";
+
+    // See if we can get anything out of this
+    std::FILE *tag_read;
+    if(!ignore_tag_data && (tag_read = std::fopen(final_path.data(), "rb"))) {
+        // Here's in case we do fail. It cleans up and exits.
+        auto exit_on_failure = [&tag_read, &final_path]() {
+            eprintf("%s could not be read.\n", final_path.data());
+            eprintf("Use --ignore-tag or -I to override.\n");
+            std::fclose(tag_read);
+            exit(EXIT_FAILURE);
+        };
+
+        // Attempt to get the header
+        TagFileHeader header;
+        if(std::fread(&header, sizeof(header), 1, tag_read) != 1) {
+            exit_on_failure();
+        }
+
+        // Make sure it's valid
+        if(header.tag_class_int != TagClassInt::TAG_CLASS_BITMAP) {
+            exit_on_failure();
+        }
+
+        // Get the main tag struct
+        Bitmap<BigEndian> bitmap_tag_header;
+        if(std::fread(&bitmap_tag_header, sizeof(bitmap_tag_header), 1, tag_read) != 1) {
+            exit_on_failure();
+        }
+
+        // Set some default values
+        if(!format.has_value()) {
+            format = bitmap_tag_header.format;
+        }
+        if(!mipmap_fade.has_value()) {
+            mipmap_fade = bitmap_tag_header.detail_fade_factor;
+        }
+        if(!bitmap_type.has_value()) {
+            bitmap_type = bitmap_tag_header.type;
+        }
+        if(!max_mipmap_count.has_value()) {
+            std::int16_t mipmap_count = bitmap_tag_header.mipmap_count.read();
+            if(mipmap_count == 0) {
+                max_mipmap_count = INT16_MAX;
+            }
+            else {
+                max_mipmap_count = mipmap_count - 1;
+            }
+        }
+        if(!sprite_usage.has_value()) {
+            sprite_usage = bitmap_tag_header.sprite_usage;
+        }
+        if(!sprite_budget.has_value()) {
+            sprite_budget = 32 << bitmap_tag_header.sprite_budget_size;
+        }
+        if(!sprite_budget_count.has_value()) {
+            sprite_budget_count = bitmap_tag_header.sprite_budget_count;
+        }
+        if(!sprite_spacing.has_value()) {
+            sprite_spacing = bitmap_tag_header.sprite_spacing;
+        }
+
+        std::fclose(tag_read);
+    }
+
+    // If format wasn't set, set it
+    if(!format.has_value()) {
+        format = BitmapFormat::BITMAP_FORMAT_32_BIT_COLOR;
+    }
+
+    // Same with bitmap type
+    if(!bitmap_type.has_value()) {
+        bitmap_type = BitmapType::BITMAP_TYPE_2D_TEXTURES;
+    }
+
+    // And these other things too
+    if(!max_mipmap_count.has_value()) {
+        max_mipmap_count = INT16_MAX;
+    }
+    if(!sprite_usage.has_value()) {
+        sprite_usage = BitmapSpriteUsage::BITMAP_SPRITE_USAGE_BLEND_ADD_SUBTRACT_MAX;
+    }
+    if(!sprite_budget.has_value()) {
+        sprite_budget = 32;
+    }
+    if(!sprite_budget_count.has_value()) {
+        sprite_budget_count = 0;
+    }
+    if(!mipmap_scale_type.has_value()) {
+        mipmap_scale_type = ScannedColorMipmapType::SCANNED_COLOR_MIPMAP_LINEAR;
+    }
+    if(!sprite_spacing.has_value()) {
+        sprite_spacing = 4;
+    }
+    if(!mipmap_fade.has_value()) {
+        mipmap_fade = 0.0F;
+    }
+
     // Have these variables handy
-    std::uint32_t image_width, image_height;
-    std::size_t image_size;
-    CompositeBitmapPixel *image_pixels;
+    std::uint32_t image_width = 0, image_height = 0;
+    std::size_t image_size = 0;
+    ColorPlatePixel *image_pixels = nullptr;
 
     // Load the bitmap file
-    std::string image_path = (data_path / (bitmap_tag + "." + input_type)).string();
+    for(auto i = SUPPORTED_FORMATS_TIF; i < SUPPORTED_FORMATS_INT_COUNT; i = static_cast<SUPPORTED_FORMATS_INT>(i + 1)) {
+        std::string image_path = (data_path / (bitmap_tag + SUPPORTED_FORMATS[i])).string();
+        if(std::filesystem::exists(image_path)) {
+            switch(i) {
+                case SUPPORTED_FORMATS_TIF:
+                case SUPPORTED_FORMATS_TIFF:
+                    image_pixels = load_tiff(image_path.data(), image_width, image_height, image_size);
+                    break;
+                case SUPPORTED_FORMATS_PNG:
+                case SUPPORTED_FORMATS_TGA:
+                case SUPPORTED_FORMATS_BMP:
+                    image_pixels = load_image(image_path.data(), image_width, image_height, image_size);
+                    break;
+                case SUPPORTED_FORMATS_INT_COUNT:
+                    std::terminate();
+                    break;
+            }
+            break;
+        }
+    }
 
-    if(std::strcmp(input_type, "tif") == 0) {
-        image_pixels = load_tiff(image_path.data(), image_width, image_height, image_size);
-    }
-    else if(std::strcmp(input_type, "png") == 0) {
-        image_pixels = load_png(image_path.data(), image_width, image_height, image_size);
-    }
-    else {
-        eprintf("Unrecognized input-type %s\n", input_type);
+    if(image_pixels == nullptr) {
+        eprintf("Failed to find %s in %s\nValid formats are:\n", bitmap_tag.data(), data);
+        for(auto *format : SUPPORTED_FORMATS) {
+            eprintf("    %s\n", format);
+        }
         return EXIT_FAILURE;
     }
 
-    // Generate the thing
-    CompositeBitmap bitmaps(image_pixels, image_width, image_height);
-    auto &bitmaps_array = bitmaps.get_bitmaps();
-    if(bitmaps_array.size() == 0) {
-        eprintf("No bitmaps found in input.\n");
-        return EXIT_FAILURE;
+    // Set up sprite parameters
+    std::optional<ColorPlateScannerSpriteParameters> sprite_parameters;
+    if(bitmap_type.value() == BitmapType::BITMAP_TYPE_SPRITES) {
+        sprite_parameters = ColorPlateScannerSpriteParameters {};
+        auto &p = sprite_parameters.value();
+        p.sprite_budget = sprite_budget.value();
+        p.sprite_budget_count = sprite_budget_count.value();
+        p.sprite_spacing = sprite_spacing.value();
+        p.sprite_usage = sprite_usage.value();
     }
+
+    // Do it!
+    auto scanned_color_plate = ColorPlateScanner::scan_color_plate(reinterpret_cast<const ColorPlatePixel *>(image_pixels), image_width, image_height, bitmap_type.value(), sprite_parameters, max_mipmap_count.value(), mipmap_scale_type.value(), mipmap_fade.value());
+    std::size_t bitmap_count = scanned_color_plate.bitmaps.size();
 
     // Start building the bitmap tag
     std::vector<std::byte> bitmap_tag_data(sizeof(TagFileHeader) + sizeof(Bitmap<BigEndian>));
@@ -247,129 +440,42 @@ int main(int argc, char *argv[]) {
 
     // Now let's add the actual bitmap data
     std::vector<std::byte> bitmap_data_pixels;
-    std::vector<BitmapData<BigEndian>> bitmap_data(bitmaps_array.size());
+    std::vector<BitmapData<BigEndian>> bitmap_data(bitmap_count);
 
     // Default mipmap parameters
-    if(mipmap_fade == -1.0F) {
+    if(!mipmap_fade.has_value()) {
         mipmap_fade = 0.0F;
-    }
-    if(mipmap_scale_type == MipmapScaleType::MIPMAP_SCALE_TYPE_TAG) {
-        mipmap_scale_type = MipmapScaleType::MIPMAP_SCALE_TYPE_LINEAR;
-    }
-    if(format == BitmapFormatType::BITMAP_FORMAT_TYPE_TAG) {
-        format = BitmapFormatType::BITMAP_FORMAT_TYPE_32_BIT;
     }
 
     // Add our bitmap data
-    for(std::size_t i = 0; i < bitmaps_array.size(); i++) {
+    printf("Found %zu bitmap%s:\n", bitmap_count, bitmap_count == 1 ? "" : "s");
+    for(std::size_t i = 0; i < bitmap_count; i++) {
         // Write all of the fields here
         auto &bitmap = bitmap_data[i];
-        auto &bitmap_pixels = bitmaps_array[i];
+        auto &bitmap_color_plate = scanned_color_plate.bitmaps[i];
         bitmap.bitmap_class = TagClassInt::TAG_CLASS_BITMAP;
-        bitmap.width = bitmap_pixels.get_width();
-        bitmap.height = bitmap_pixels.get_height();
-        bitmap.depth = 1;
-        bitmap.type = BitmapDataType::BITMAP_TYPE__2D_TEXTURE;
+        bitmap.width = bitmap_color_plate.width;
+        bitmap.height = bitmap_color_plate.height;
+        switch(bitmap_type.value()) {
+            case BitmapType::BITMAP_TYPE_CUBE_MAPS:
+                bitmap.type = BitmapDataType::BITMAP_DATA_TYPE_CUBE_MAP;
+                bitmap.depth = 1;
+                break;
+            case BitmapType::BITMAP_TYPE_3D_TEXTURES:
+                bitmap.type = BitmapDataType::BITMAP_DATA_TYPE_3D_TEXTURE;
+                bitmap.depth = bitmap_color_plate.depth;
+                break;
+            default:
+                bitmap.type = BitmapDataType::BITMAP_DATA_TYPE_2D_TEXTURE;
+                bitmap.depth = 1;
+                break;
+        }
         bitmap.flags = BigEndian<BitmapDataFlags> {};
-        bitmap.registration_point = Point2DInt<BigEndian> {};
+        bitmap.pixels_offset = static_cast<std::uint32_t>(bitmap_data_pixels.size());
+        std::uint32_t mipmap_count = bitmap_color_plate.mipmaps.size();
 
-        // Calculate how big the bitmap is
-        std::size_t total_size = 0;
-        std::size_t mipmap_width = bitmap_pixels.get_width();
-        std::size_t mipmap_height = bitmap_pixels.get_height();
-        std::size_t mipmap_count = bitmap_pixels.get_mipmap_count();
-        for(std::size_t i = 0; i <= mipmap_count; i++) {
-            total_size += mipmap_width * mipmap_height * 4;
-            mipmap_height /= 2;
-            mipmap_width /= 2;
-        }
-
-        // Generate mipmaps?
-        const auto *pixels_start = reinterpret_cast<const std::byte *>(bitmap_pixels.get_pixels());
-        std::vector<std::byte> current_bitmap_pixels(pixels_start, pixels_start + total_size);
-
-        // Process mipmaps
-        if(mipmap_scale_type != MipmapScaleType::MIPMAP_SCALE_TYPE_NONE) {
-            while(mipmap_height > 0 && mipmap_width > 0) {
-                // Get the last mipmap
-                const auto *last_mipmap = reinterpret_cast<const CompositeBitmapPixel *>(current_bitmap_pixels.data() + current_bitmap_pixels.size() - (mipmap_height * 2) * (mipmap_width * 2) * sizeof(CompositeBitmapPixel));
-
-                // Allocate data to hold the new mipmap data
-                std::vector<std::byte> this_mipmap_v(mipmap_height * mipmap_width * sizeof(CompositeBitmapPixel));
-                auto *this_mipmap = reinterpret_cast<CompositeBitmapPixel *>(this_mipmap_v.data());
-                for(std::size_t y = 0; y < mipmap_height; y++) {
-                    for(std::size_t x = 0; x < mipmap_width; x++) {
-                        // Get the pixels
-                        CompositeBitmapPixel pixels[4] = {
-                            last_mipmap[x * 2 + y * 2 * mipmap_width * 2],
-                            last_mipmap[x * 2 + 1 + y * 2 * mipmap_width * 2],
-                            last_mipmap[x * 2 + (y * 2 + 1) * mipmap_width * 2],
-                            last_mipmap[x * 2 + 1 + (y * 2 + 1) * mipmap_width * 2]
-                        };
-
-                        // Get this mipmap pixel
-                        CompositeBitmapPixel &pixel = this_mipmap[y * mipmap_width + x];
-
-                        // Average the pixels
-                        switch(mipmap_scale_type) {
-                            case MipmapScaleType::MIPMAP_SCALE_TYPE_LINEAR:
-                            case MipmapScaleType::MIPMAP_SCALE_TYPE_NEAREST_ALPHA:
-                                #define AVERAGE_CHANNEL_VALUE(channel) static_cast<std::uint8_t>(static_cast<std::size_t>(pixels[0].channel + pixels[1].channel + pixels[2].channel + pixels[3].channel) / 4)
-
-                                // Determine whether or not to interpolate the alpha
-                                if(mipmap_scale_type == MipmapScaleType::MIPMAP_SCALE_TYPE_NEAREST_ALPHA) {
-                                    pixel.alpha = pixels[0].alpha;
-                                }
-                                else {
-                                    pixel.alpha = AVERAGE_CHANNEL_VALUE(alpha);
-                                }
-
-                                // Interpolate RGB
-                                pixel.red = AVERAGE_CHANNEL_VALUE(red);
-                                pixel.green = AVERAGE_CHANNEL_VALUE(green);
-                                pixel.blue = AVERAGE_CHANNEL_VALUE(blue);
-                                break;
-
-                            case MipmapScaleType::MIPMAP_SCALE_TYPE_NEAREST:
-                                pixel = pixels[0];
-                                break;
-
-                            default:
-                                break;
-                        }
-
-                        // Fade to gray?
-                        if(mipmap_fade > 0.0F) {
-                            // Alpha -> white
-                            std::uint32_t alpha_delta = pixel.alpha * mipmap_fade + 1;
-                            if(static_cast<std::uint32_t>(0xFF - pixel.alpha) < alpha_delta) {
-                                pixel.alpha = 0xFF;
-                            }
-                            else {
-                                pixel.alpha += alpha_delta;
-                            }
-
-                            // RGB -> gray
-                            pixel.red -= (static_cast<int>(pixel.red) - 0x7F) * mipmap_fade;
-                            pixel.green -= (static_cast<int>(pixel.green) - 0x7F) * mipmap_fade;
-                            pixel.blue -= (static_cast<int>(pixel.blue) - 0x7F) * mipmap_fade;
-                        }
-                    }
-                }
-
-                // Handle compression
-                bitmap.format = BitmapDataFormat::BITMAP_FORMAT_A8R8G8B8;
-
-                // Add the new mipmap
-                total_size += this_mipmap_v.size();
-                current_bitmap_pixels.insert(current_bitmap_pixels.end(), this_mipmap_v.begin(), this_mipmap_v.end());
-
-                // Halve both dimensions and add mipmap count
-                mipmap_height /= 2;
-                mipmap_width /= 2;
-                mipmap_count++;
-            }
-        }
+        // Get the data
+        std::vector<std::byte> current_bitmap_pixels(reinterpret_cast<std::byte *>(bitmap_color_plate.pixels.data()), reinterpret_cast<std::byte *>(bitmap_color_plate.pixels.data() + bitmap_color_plate.pixels.size()));
 
         // Determine if there is any alpha present
         enum AlphaType {
@@ -377,30 +483,67 @@ int main(int argc, char *argv[]) {
             ALPHA_TYPE_ONE_BIT,
             ALPHA_TYPE_MULTI_BIT
         };
+
+        bool alpha_equals_luminosity = true;
+        bool luminosity_set = false;
+
         AlphaType alpha_present = ALPHA_TYPE_NONE;
-        auto *first_pixel = reinterpret_cast<CompositeBitmapPixel *>(current_bitmap_pixels.data());
-        auto *last_pixel = reinterpret_cast<CompositeBitmapPixel *>(current_bitmap_pixels.data() + current_bitmap_pixels.size());
+        auto *first_pixel = reinterpret_cast<ColorPlatePixel *>(current_bitmap_pixels.data());
+        auto *last_pixel = reinterpret_cast<ColorPlatePixel *>(current_bitmap_pixels.data() + current_bitmap_pixels.size());
         std::size_t pixel_count = last_pixel - first_pixel;
 
-        for(auto *pixel = first_pixel; pixel < last_pixel; pixel++) {
-            if(pixel->alpha != 0xFF) {
-                if(pixel->alpha == 0) {
-                    alpha_present = ALPHA_TYPE_ONE_BIT;
+        // If we need to do monochrome, check if the alpha equals luminosity
+        if(format == BitmapFormat::BITMAP_FORMAT_MONOCHROME) {
+            for(auto *pixel = first_pixel; pixel < last_pixel; pixel++) {
+                std::uint8_t luminosity = ColorPlatePixel::convert_to_y8(pixel);
+
+                // First, check if the luminosity is the same as alpha. If not, AY8 is not an option.
+                if(luminosity != pixel->alpha) {
+                    alpha_equals_luminosity = false;
+
+                    // Next, check if luminosity is not 0xFF. If so, A8 is not an option
+                    if(luminosity != 0xFF) {
+                        luminosity_set = true;
+                    }
+
+                    // Next, check if the alpha is set. If so, A8Y8 or A8 are options. Otherwise, Y8 is what we can do.
+                    if(pixel->alpha != 0xFF) {
+                        alpha_present = ALPHA_TYPE_MULTI_BIT;
+                    }
                 }
-                else {
-                    alpha_present = ALPHA_TYPE_MULTI_BIT;
-                    break;
+            }
+        }
+
+        // If we aren't doing monochrome, then we the bitness of the alpha
+        else {
+            for(auto *pixel = first_pixel; pixel < last_pixel; pixel++) {
+                if(pixel->alpha != 0xFF) {
+                    if(pixel->alpha == 0) {
+                        alpha_present = ALPHA_TYPE_ONE_BIT;
+                    }
+                    else {
+                        alpha_present = ALPHA_TYPE_MULTI_BIT;
+                        break;
+                    }
                 }
             }
         }
 
         // Set the format
-        switch(format) {
-            case BITMAP_FORMAT_TYPE_TAG:
-            case BITMAP_FORMAT_TYPE_32_BIT:
+        auto format_check = format.value();
+        bool compressed = (format_check == BitmapFormat::BITMAP_FORMAT_COMPRESSED_WITH_COLOR_KEY_TRANSPARENCY || format_check == BitmapFormat::BITMAP_FORMAT_COMPRESSED_WITH_EXPLICIT_ALPHA || format_check == BitmapFormat::BITMAP_FORMAT_COMPRESSED_WITH_INTERPOLATED_ALPHA);
+
+        // If the bitmap length or height isn't divisible by 4, use 32-bit color
+        if(compressed && ((bitmap.height.read() % 4) != 0 || (bitmap.width.read() % 4) != 0)) {
+            format_check = BitmapFormat::BITMAP_FORMAT_32_BIT_COLOR;
+            compressed = false;
+        }
+
+        switch(format_check) {
+            case BitmapFormat::BITMAP_FORMAT_32_BIT_COLOR:
                 bitmap.format = alpha_present == AlphaType::ALPHA_TYPE_NONE ? BitmapDataFormat::BITMAP_FORMAT_X8R8G8B8 : BitmapDataFormat::BITMAP_FORMAT_A8R8G8B8;
                 break;
-            case BITMAP_FORMAT_TYPE_16_BIT:
+            case BitmapFormat::BITMAP_FORMAT_16_BIT_COLOR:
                 switch(alpha_present) {
                     case ALPHA_TYPE_NONE:
                         bitmap.format = BitmapDataFormat::BITMAP_FORMAT_R5G6B5;
@@ -413,15 +556,36 @@ int main(int argc, char *argv[]) {
                         break;
                 }
                 break;
-            case BITMAP_FORMAT_TYPE_DXT1:
+            case BitmapFormat::BITMAP_FORMAT_MONOCHROME:
+                if(alpha_equals_luminosity) {
+                    bitmap.format = BitmapDataFormat::BITMAP_FORMAT_AY8;
+                }
+                else if(alpha_present == ALPHA_TYPE_MULTI_BIT) {
+                    if(luminosity_set) {
+                        bitmap.format = BitmapDataFormat::BITMAP_FORMAT_A8Y8;
+                    }
+                    else {
+                        bitmap.format = BitmapDataFormat::BITMAP_FORMAT_A8;
+                    }
+                }
+                else {
+                    bitmap.format = BitmapDataFormat::BITMAP_FORMAT_Y8;
+                }
+                break;
+
+            case BitmapFormat::BITMAP_FORMAT_COMPRESSED_WITH_COLOR_KEY_TRANSPARENCY:
                 bitmap.format = BitmapDataFormat::BITMAP_FORMAT_DXT1;
                 break;
-            case BITMAP_FORMAT_TYPE_DXT3:
+            case BitmapFormat::BITMAP_FORMAT_COMPRESSED_WITH_EXPLICIT_ALPHA:
                 bitmap.format = alpha_present == AlphaType::ALPHA_TYPE_NONE ? BitmapDataFormat::BITMAP_FORMAT_DXT1 : BitmapDataFormat::BITMAP_FORMAT_DXT3;
                 break;
-            case BITMAP_FORMAT_TYPE_DXT5:
+            case BitmapFormat::BITMAP_FORMAT_COMPRESSED_WITH_INTERPOLATED_ALPHA:
                 bitmap.format = alpha_present == AlphaType::ALPHA_TYPE_NONE ? BitmapDataFormat::BITMAP_FORMAT_DXT1 : BitmapDataFormat::BITMAP_FORMAT_DXT5;
                 break;
+
+            default:
+                eprintf("Unsupported bitmap format.\n");
+                return EXIT_FAILURE;
         }
 
         // Depending on the format, do something
@@ -437,26 +601,17 @@ int main(int argc, char *argv[]) {
             case BitmapDataFormat::BITMAP_FORMAT_A4R4G4B4:
             case BitmapDataFormat::BITMAP_FORMAT_R5G6B5: {
                 // Figure out what we'll be doing
-                std::uint8_t alpha, red, green, blue;
+                uint16_t (*conversion_function)(const ColorPlatePixel *);
 
                 switch(bitmap_format) {
                     case BitmapDataFormat::BITMAP_FORMAT_A1R5G5B5:
-                        alpha = 1;
-                        red = 5;
-                        green = 5;
-                        blue = 5;
+                        conversion_function = ColorPlatePixel::convert_to_16_bit<1,5,5,5>;
                         break;
                     case BitmapDataFormat::BITMAP_FORMAT_A4R4G4B4:
-                        alpha = 4;
-                        red = 4;
-                        green = 4;
-                        blue = 4;
+                        conversion_function = ColorPlatePixel::convert_to_16_bit<4,4,4,4>;
                         break;
                     case BitmapDataFormat::BITMAP_FORMAT_R5G6B5:
-                        alpha = 0;
-                        red = 5;
-                        green = 6;
-                        blue = 5;
+                        conversion_function = ColorPlatePixel::convert_to_16_bit<0,5,6,5>;
                         break;
                     default:
                         std::terminate();
@@ -464,10 +619,10 @@ int main(int argc, char *argv[]) {
                 }
 
                 // Begin
-                std::vector<LittleEndian<std::uint16_t>> new_bitmap_pixels(pixel_count * sizeof(std::uint16_t));
+                std::vector<LittleEndian<std::uint16_t>> new_bitmap_pixels(pixel_count);
                 auto *pixel_16_bit = reinterpret_cast<std::uint16_t *>(new_bitmap_pixels.data());
-                for(CompositeBitmapPixel *pixel_32_bit = first_pixel; pixel_32_bit < last_pixel; pixel_32_bit++, pixel_16_bit++) {
-                    *pixel_16_bit = pixel_32_bit->to_16_bit(alpha, red, green, blue);
+                for(ColorPlatePixel *pixel_32_bit = first_pixel; pixel_32_bit < last_pixel; pixel_32_bit++, pixel_16_bit++) {
+                    *pixel_16_bit = conversion_function(pixel_32_bit);
                 }
 
                 // Replace buffers
@@ -477,12 +632,129 @@ int main(int argc, char *argv[]) {
                 break;
             }
 
-            // If it's DXTn, tell them to shove it
+            // If it's monochrome, it depends
+            case BitmapDataFormat::BITMAP_FORMAT_A8:
+            case BitmapDataFormat::BITMAP_FORMAT_AY8: {
+                std::vector<LittleEndian<std::uint8_t>> new_bitmap_pixels(pixel_count);
+                auto *pixel_8_bit = reinterpret_cast<std::uint8_t *>(new_bitmap_pixels.data());
+                for(auto *pixel = first_pixel; pixel < last_pixel; pixel++, pixel_8_bit++) {
+                    *pixel_8_bit = pixel->alpha;
+                }
+                current_bitmap_pixels.clear();
+                current_bitmap_pixels.insert(current_bitmap_pixels.end(), reinterpret_cast<std::byte *>(new_bitmap_pixels.begin().base()), reinterpret_cast<std::byte *>(new_bitmap_pixels.end().base()));
+                break;
+            }
+            case BitmapDataFormat::BITMAP_FORMAT_Y8: {
+                std::vector<LittleEndian<std::uint8_t>> new_bitmap_pixels(pixel_count);
+                auto *pixel_8_bit = reinterpret_cast<std::uint8_t *>(new_bitmap_pixels.data());
+                for(auto *pixel = first_pixel; pixel < last_pixel; pixel++, pixel_8_bit++) {
+                    *pixel_8_bit = ColorPlatePixel::convert_to_y8(pixel);
+                }
+                current_bitmap_pixels.clear();
+                current_bitmap_pixels.insert(current_bitmap_pixels.end(), reinterpret_cast<std::byte *>(new_bitmap_pixels.begin().base()), reinterpret_cast<std::byte *>(new_bitmap_pixels.end().base()));
+                break;
+            }
+            case BitmapDataFormat::BITMAP_FORMAT_A8Y8: {
+                std::vector<LittleEndian<std::uint16_t>> new_bitmap_pixels(pixel_count);
+                auto *pixel_16_bit = reinterpret_cast<std::uint16_t *>(new_bitmap_pixels.data());
+                for(auto *pixel = first_pixel; pixel < last_pixel; pixel++, pixel_16_bit++) {
+                    *pixel_16_bit = ColorPlatePixel::convert_to_a8y8(pixel);
+                }
+                current_bitmap_pixels.clear();
+                current_bitmap_pixels.insert(current_bitmap_pixels.end(), reinterpret_cast<std::byte *>(new_bitmap_pixels.begin().base()), reinterpret_cast<std::byte *>(new_bitmap_pixels.end().base()));
+                break;
+            }
+
+            // Do DisguXTing compression
             case BitmapDataFormat::BITMAP_FORMAT_DXT1:
             case BitmapDataFormat::BITMAP_FORMAT_DXT3:
-            case BitmapDataFormat::BITMAP_FORMAT_DXT5:
-                eprintf("DTXn compression is not currently supported.\n");
-                return EXIT_FAILURE;
+            case BitmapDataFormat::BITMAP_FORMAT_DXT5: {
+                // Begin
+                bool use_dxt1 = bitmap.format == BitmapDataFormat::BITMAP_FORMAT_DXT1;
+                bool use_dxt3 = bitmap.format == BitmapDataFormat::BITMAP_FORMAT_DXT3;
+                bool use_dxt5 = bitmap.format == BitmapDataFormat::BITMAP_FORMAT_DXT5;
+                std::size_t pixel_size = (!use_dxt1) ? 2 : 1;
+                std::vector<std::byte> new_bitmap_pixels(pixel_count * pixel_size / 2);
+                auto *compressed_pixel = new_bitmap_pixels.data();
+
+                std::size_t mipmap_width = bitmap.width;
+                std::size_t mipmap_height = bitmap.height;
+
+                auto *uncompressed_pixel = first_pixel;
+
+                #define BLOCK_LENGTH 4
+
+                std::size_t mipmaps_reduced = 0;
+
+                std::size_t pixel_increment = BLOCK_LENGTH * (use_dxt3 ? 1 : pixel_size) * 2;
+
+                // Go through each 4x4 block and make them compressed
+                for(std::size_t i = 0; i <= mipmap_count; i++) {
+                    std::uint32_t effective_mipmap_height = mipmap_height;
+                    if(bitmap.type == BitmapDataType::BITMAP_DATA_TYPE_CUBE_MAP) {
+                        effective_mipmap_height *= 6;
+                    }
+
+                    if(mipmap_width >= BLOCK_LENGTH && effective_mipmap_height >= BLOCK_LENGTH) {
+                        for(std::size_t y = 0; y < effective_mipmap_height; y += BLOCK_LENGTH) {
+                            for(std::size_t x = 0; x < mipmap_width; x += BLOCK_LENGTH) {
+                                // Let's make the 4x4 block
+                                ColorPlatePixel block[BLOCK_LENGTH * BLOCK_LENGTH];
+
+                                // Get the block
+                                for(int i = 0; i < BLOCK_LENGTH; i++) {
+                                    std::size_t offset = ((y + i) * mipmap_width + x);
+                                    auto *first_block_pixel = block + i * BLOCK_LENGTH;
+                                    auto *first_uncompressed_pixel = uncompressed_pixel + offset;
+
+                                    for(std::size_t j = 0; j < 4; j++) {
+                                        first_block_pixel[j].alpha = first_uncompressed_pixel[j].alpha;
+                                        first_block_pixel[j].red = first_uncompressed_pixel[j].blue;
+                                        first_block_pixel[j].green = first_uncompressed_pixel[j].green;
+                                        first_block_pixel[j].blue = first_uncompressed_pixel[j].red;
+                                    }
+                                }
+
+                                // If we're using DXT3, put the alpha in here
+                                if(use_dxt3) {
+                                    std::uint64_t dxt3_alpha = 0;
+
+                                    // Alpha is stored in order from the first ones being the least significant bytes, and the last ones being the most significant bytes
+                                    for(int i = 0; i < BLOCK_LENGTH * BLOCK_LENGTH; i++) {
+                                        dxt3_alpha <<= 4;
+                                        dxt3_alpha |= (block[BLOCK_LENGTH * BLOCK_LENGTH - i - 1].alpha * 15 + UINT8_MAX + 1) / UINT8_MAX / 2;
+                                    }
+
+                                    auto &compressed_alpha = *reinterpret_cast<LittleEndian<std::uint64_t> *>(compressed_pixel);
+                                    compressed_alpha = dxt3_alpha;
+                                    compressed_pixel += sizeof(compressed_alpha);
+                                }
+
+                                // Compress
+                                stb_compress_dxt_block(reinterpret_cast<unsigned char *>(compressed_pixel), reinterpret_cast<unsigned char *>(block), use_dxt5, STB_DXT_HIGHQUAL | (dithering ? STB_DXT_DITHER : 0));
+                                compressed_pixel += pixel_increment;
+                            }
+                        }
+                    }
+                    else {
+                        mipmaps_reduced++;
+                    }
+
+                    uncompressed_pixel += mipmap_width * effective_mipmap_height;
+                    mipmap_width /= 2;
+                    mipmap_height /= 2;
+                }
+
+                current_bitmap_pixels.clear();
+                current_bitmap_pixels.insert(current_bitmap_pixels.end(), new_bitmap_pixels.data(), reinterpret_cast<std::byte *>(compressed_pixel));
+
+                // If we had to cut out mipmaps due to them being less than 4x4, here we go
+                mipmap_count -= mipmaps_reduced;
+
+                #undef BLOCK_LENGTH
+
+                break;
+            }
 
             default:
                 bitmap.format = alpha_present == AlphaType::ALPHA_TYPE_NONE ? BitmapDataFormat::BITMAP_FORMAT_X8R8G8B8 : BitmapDataFormat::BITMAP_FORMAT_A8R8G8B8;
@@ -495,13 +767,52 @@ int main(int argc, char *argv[]) {
         bitmap.mipmap_count = mipmap_count;
         bitmap.pixels_count = current_bitmap_pixels.size();
 
-        eprintf("Bitmap #%zu: %zux%zu, %zu mipmap%s\n", i, bitmaps_array[i].get_width(), bitmaps_array[i].get_height(), mipmap_count, mipmap_count == 1 ? "" : "s");
+        BitmapDataFlags flags = {};
+        flags.compressed = compressed;
+        flags.power_of_two_dimensions = 1;
+        bitmap.flags = flags;
+
+        bitmap.registration_point.x = bitmap_color_plate.registration_point_x;
+        bitmap.registration_point.y = bitmap_color_plate.registration_point_y;
+
+        #define BYTES_TO_MIB(bytes) (bytes / 1024.0F / 1024.0F)
+
+        printf("    Bitmap #%zu: %ux%u, %u mipmap%s, %s - %.03f MiB\n", i, scanned_color_plate.bitmaps[i].width, scanned_color_plate.bitmaps[i].height, mipmap_count, mipmap_count == 1 ? "" : "s", bitmap_data_format_name(bitmap.format), BYTES_TO_MIB(current_bitmap_pixels.size()));
     }
-    printf("Found %zu bitmap%s total. (%.02f MiB)\n", bitmaps_array.size(), bitmaps_array.size() == 1 ? "" : "s", bitmap_data_pixels.size() / 1024.0F / 1024.0F);
+    printf("Total: %.03f MiB\n", BYTES_TO_MIB(bitmap_data_pixels.size()));
 
     // Add the bitmap pixel data
     bitmap_tag_data.insert(bitmap_tag_data.end(), bitmap_data_pixels.begin(), bitmap_data_pixels.end());
     new_tag_header.processed_pixel_data.size = bitmap_data_pixels.size();
+
+    // Add all sequences
+    std::vector<std::byte> sprite_data;
+    for(auto &sequence : scanned_color_plate.sequences) {
+        BitmapGroupSequence<BigEndian> bgs = {};
+        bgs.first_bitmap_index = sequence.first_bitmap;
+        bgs.bitmap_count = sequence.bitmap_count;
+
+        bgs.sprites.count = static_cast<std::uint32_t>(sequence.sprites.size());
+        for(auto &sprite : sequence.sprites) {
+            BitmapGroupSprite<BigEndian> bgss = {};
+            auto &bitmap = scanned_color_plate.bitmaps[sprite.bitmap_index];
+            bgss.bitmap_index = sprite.bitmap_index;
+
+            bgss.bottom = static_cast<float>(sprite.bottom) / bitmap.height;
+            bgss.top = static_cast<float>(sprite.top) / bitmap.height;
+            bgss.registration_point.y = static_cast<float>(sprite.registration_point_y) / bitmap.height;
+
+            bgss.left = static_cast<float>(sprite.left) / bitmap.width;
+            bgss.right = static_cast<float>(sprite.right) / bitmap.width;
+            bgss.registration_point.x = static_cast<float>(sprite.registration_point_x) / bitmap.width;
+
+            sprite_data.insert(sprite_data.end(), reinterpret_cast<const std::byte *>(&bgss), reinterpret_cast<const std::byte *>(&bgss + 1));
+        }
+
+        bitmap_tag_data.insert(bitmap_tag_data.end(), reinterpret_cast<const std::byte *>(&bgs), reinterpret_cast<const std::byte *>(&bgs + 1));
+    }
+    new_tag_header.bitmap_group_sequence.count = scanned_color_plate.sequences.size();
+    bitmap_tag_data.insert(bitmap_tag_data.end(), sprite_data.begin(), sprite_data.end());
 
     // Add the bitmap tag data
     const auto *bitmap_data_start = reinterpret_cast<const std::byte *>(bitmap_data.data());
@@ -510,19 +821,47 @@ int main(int argc, char *argv[]) {
     new_tag_header.bitmap_data.count = bitmap_data.size();
 
     // Set more parameters
+    new_tag_header.type = bitmap_type.value();
     new_tag_header.usage = BitmapUsage::BITMAP_USAGE_DEFAULT;
-    new_tag_header.detail_fade_factor = mipmap_fade;
+    new_tag_header.detail_fade_factor = mipmap_fade.value();
+    new_tag_header.format = format.value();
+    if(max_mipmap_count.value() >= INT16_MAX) {
+        new_tag_header.mipmap_count = 0;
+    }
+    else {
+        new_tag_header.mipmap_count = max_mipmap_count.value() + 1;
+    }
+
+    new_tag_header.sprite_spacing = sprite_spacing.value();
+    new_tag_header.sprite_budget_count = sprite_budget_count.value();
+    new_tag_header.sprite_usage = sprite_usage.value();
+    auto &sprite_budget_value = sprite_budget.value();
+    switch(sprite_budget_value) {
+        case 32:
+            new_tag_header.sprite_budget_size = BitmapSpriteBudgetSize::BITMAP_SPRITE_BUDGET_SIZE_32X32;
+            break;
+        case 64:
+            new_tag_header.sprite_budget_size = BitmapSpriteBudgetSize::BITMAP_SPRITE_BUDGET_SIZE_64X64;
+            break;
+        case 128:
+            new_tag_header.sprite_budget_size = BitmapSpriteBudgetSize::BITMAP_SPRITE_BUDGET_SIZE_128X128;
+            break;
+        case 256:
+            new_tag_header.sprite_budget_size = BitmapSpriteBudgetSize::BITMAP_SPRITE_BUDGET_SIZE_256X256;
+            break;
+        case 512:
+            new_tag_header.sprite_budget_size = BitmapSpriteBudgetSize::BITMAP_SPRITE_BUDGET_SIZE_512X512;
+            break;
+        default:
+            new_tag_header.sprite_budget_size = BitmapSpriteBudgetSize::BITMAP_SPRITE_BUDGET_SIZE_32X32;
+            break;
+    }
 
     // Add the struct in
     *reinterpret_cast<Bitmap<BigEndian> *>(bitmap_tag_data.data() + sizeof(TagFileHeader)) = new_tag_header;
 
-    // Get the path
-    std::filesystem::path tags_path(tags);
-    auto tag_path = tags_path / bitmap_tag;
-
     // Write it all
     std::filesystem::create_directories(tag_path.parent_path());
-    auto final_path = tag_path.string() + ".bitmap";
     std::FILE *tag_write = std::fopen(final_path.data(), "wb");
     if(!tag_write) {
         eprintf("Error: Failed to open %s for writing.\n", final_path.data());;
@@ -540,7 +879,48 @@ int main(int argc, char *argv[]) {
     return 0;
 }
 
-static Invader::CompositeBitmapPixel *load_tiff(const char *path, std::uint32_t &image_width, std::uint32_t &image_height, std::size_t &image_size) {
+#define ALLOCATE_PIXELS(count) reinterpret_cast<Invader::ColorPlatePixel *>(calloc(sizeof(Invader::ColorPlatePixel) * pixel_count, 1))
+
+static Invader::ColorPlatePixel *rgba_to_pixel(const std::uint8_t *data, std::size_t pixel_count) {
+    auto *pixel_data = ALLOCATE_PIXELS(pixel_count);
+
+    for(std::size_t i = 0; i < pixel_count; i++) {
+        pixel_data[i].alpha = data[3];
+        pixel_data[i].red = data[0];
+        pixel_data[i].green = data[1];
+        pixel_data[i].blue = data[2];
+        data += 4;
+    }
+
+    return pixel_data;
+}
+
+#undef ALLOCATE_PIXELS
+
+static Invader::ColorPlatePixel *load_image(const char *path, std::uint32_t &image_width, std::uint32_t &image_height, std::size_t &image_size) {
+    // Load it
+    int x = 0, y = 0, channels = 0;
+    auto *image_buffer = stbi_load(path, &x, &y, &channels, 4);
+    if(!image_buffer) {
+        eprintf("Failed to load %s. Error was: %s\n", path, stbi_failure_reason());
+        exit(EXIT_FAILURE);
+    }
+
+    // Get the width and height
+    image_width = static_cast<std::uint32_t>(x);
+    image_height = static_cast<std::uint32_t>(y);
+    image_size = image_width * image_height * sizeof(Invader::ColorPlatePixel);
+
+    // Do the thing
+    Invader::ColorPlatePixel *return_value = rgba_to_pixel(reinterpret_cast<std::uint8_t *>(image_buffer), image_width * image_height);
+
+    // Free the buffer
+    stbi_image_free(image_buffer);
+
+    return return_value;
+}
+
+static Invader::ColorPlatePixel *load_tiff(const char *path, std::uint32_t &image_width, std::uint32_t &image_height, std::size_t &image_size) {
     TIFF *image_tiff = TIFFOpen(path, "r");
     if(!image_tiff) {
         eprintf("Cannot open %s\n", path);
@@ -549,9 +929,13 @@ static Invader::CompositeBitmapPixel *load_tiff(const char *path, std::uint32_t 
     TIFFGetField(image_tiff, TIFFTAG_IMAGEWIDTH, &image_width);
     TIFFGetField(image_tiff, TIFFTAG_IMAGELENGTH, &image_height);
 
+    // Force associated alpha so alpha doesn't get multiplied in TIFFReadRGBAImageOriented
+    uint16_t ua[] = { EXTRASAMPLE_ASSOCALPHA };
+    TIFFSetField(image_tiff, TIFFTAG_EXTRASAMPLES, 1, ua);
+
     // Read it all
-    image_size = image_width * image_height * sizeof(Invader::CompositeBitmapPixel);
-    auto *image_pixels = reinterpret_cast<Invader::CompositeBitmapPixel *>(std::calloc(image_size, 1));
+    image_size = image_width * image_height * sizeof(Invader::ColorPlatePixel);
+    auto *image_pixels = reinterpret_cast<Invader::ColorPlatePixel *>(std::calloc(image_size, 1));
     TIFFReadRGBAImageOriented(image_tiff, image_width, image_height, reinterpret_cast<std::uint32_t *>(image_pixels), ORIENTATION_TOPLEFT);
 
     // Close the TIFF
@@ -559,68 +943,7 @@ static Invader::CompositeBitmapPixel *load_tiff(const char *path, std::uint32_t 
 
     // Swap red and blue channels
     for(std::size_t i = 0; i < image_size / 4; i++) {
-        Invader::CompositeBitmapPixel swapped = image_pixels[i];
-        swapped.red = image_pixels[i].blue;
-        swapped.blue = image_pixels[i].red;
-        image_pixels[i] = swapped;
-    }
-
-    return image_pixels;
-}
-
-static Invader::CompositeBitmapPixel *load_png(const char *path, std::uint32_t &image_width, std::uint32_t &image_height, std::size_t &image_size) {
-    FILE *image_png_file = fopen(path, "r");
-    if(!image_png_file) {
-        eprintf("Cannot open %s\n", path);
-        exit(EXIT_FAILURE);
-    }
-
-    // Check the header
-    char header[8] = {};
-    std::fread(header, sizeof(header), 1, image_png_file);
-    if(png_sig_cmp(reinterpret_cast<png_const_bytep>(header), 0, 8)) {
-        eprintf("Invalid PNG file %s\n", path);
-        exit(EXIT_FAILURE);
-    }
-
-    // Get metadata
-    png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
-    png_init_io(png, image_png_file);
-    png_set_sig_bytes(png, 8);
-    png_infop png_info = png_create_info_struct(png);
-    png_read_info(png, png_info);
-    image_width = png_get_image_width(png, png_info);
-    image_height = png_get_image_height(png, png_info);
-
-    if(png_get_bit_depth(png, png_info) != 8) {
-        eprintf("Unsupported at this time...\n");
-        exit(EXIT_FAILURE);
-    }
-
-    // Read it
-    png_bytep *row_pointers = reinterpret_cast<png_bytep *>(malloc(sizeof(png_bytep) * image_height));
-    image_size = 0;
-    std::size_t rowbytes_size = png_get_rowbytes(png, png_info);
-    for(std::size_t y = 0; y < image_height; y++) {
-        row_pointers[y] = reinterpret_cast<png_byte *>(malloc(rowbytes_size));
-        image_size += rowbytes_size;
-    }
-    png_read_image(png, row_pointers);
-    fclose(image_png_file);
-
-    // Now allocate and copy stuff
-    auto *image_pixels = reinterpret_cast<Invader::CompositeBitmapPixel *>(std::calloc(image_size, 1));
-    for(std::size_t y = 0; y < image_height; y++) {
-        std::memcpy(image_pixels + y * rowbytes_size / sizeof(*image_pixels), row_pointers[y], rowbytes_size);
-        std::free(row_pointers[y]);
-    }
-
-    // Free
-    std::free(row_pointers);
-
-    // Swap red and blue channels
-    for(std::size_t i = 0; i < image_size / 4; i++) {
-        Invader::CompositeBitmapPixel swapped = image_pixels[i];
+        Invader::ColorPlatePixel swapped = image_pixels[i];
         swapped.red = image_pixels[i].blue;
         swapped.blue = image_pixels[i].red;
         image_pixels[i] = swapped;

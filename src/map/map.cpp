@@ -9,6 +9,7 @@
 #include "../tag/hek/class/gbxmodel.hpp"
 #include "../tag/hek/class/scenario.hpp"
 #include "../tag/hek/class/sound.hpp"
+#include "../resource/hek/resource_map.hpp"
 
 #include "map.hpp"
 
@@ -19,9 +20,13 @@ namespace Invader {
                            const std::byte *sounds_data, std::size_t sounds_data_size) {
         Map map;
         map.data_m.insert(map.data_m.end(), data, data + data_size);
+        map.data = map.data_m.data();
         map.bitmap_data_m.insert(map.bitmap_data_m.end(), bitmaps_data, bitmaps_data + bitmaps_data_size);
+        map.bitmap_data = map.bitmap_data_m.data();
         map.sound_data_m.insert(map.sound_data_m.end(), sounds_data, sounds_data + sounds_data_size);
+        map.sound_data = map.sound_data_m.data();
         map.loc_data_m.insert(map.loc_data_m.end(), loc_data, loc_data + loc_data_size);
+        map.loc_data = map.loc_data_m.data();
         map.data_length = data_size;
         map.bitmap_data_length = bitmaps_data_size;
         map.loc_data_length = loc_data_size;
@@ -100,12 +105,12 @@ namespace Invader {
         return const_cast<Map *>(this)->get_tag_data_at_offset(offset, minimum_size);
     }
 
-    std::byte *Map::resolve_tag_data_pointer(std::uint32_t offset, std::size_t minimum_size) {
-        return this->get_tag_data_at_offset(offset - this->base_memory_address, minimum_size);
+    std::byte *Map::resolve_tag_data_pointer(HEK::Pointer pointer, std::size_t minimum_size) {
+        return this->get_tag_data_at_offset(pointer - this->base_memory_address, minimum_size);
     }
 
-    const std::byte *Map::resolve_tag_data_pointer(std::uint32_t offset, std::size_t minimum_size) const {
-        return const_cast<Map *>(this)->resolve_tag_data_pointer(offset, minimum_size);
+    const std::byte *Map::resolve_tag_data_pointer(HEK::Pointer pointer, std::size_t minimum_size) const {
+        return const_cast<Map *>(this)->resolve_tag_data_pointer(pointer, minimum_size);
     }
 
     std::size_t Map::tag_count() const noexcept {
@@ -187,13 +192,69 @@ namespace Invader {
                 continue;
             }
             else if(tags[i].indexed) {
-                // TODO: Handle indexed tags
+                tag.indexed = true;
+
+                // Find where it's located
+                DataMapType type;
+                switch(tag.p_tag_class_int) {
+                    case TagClassInt::TAG_CLASS_BITMAP:
+                        type = DataMapType::DATA_MAP_BITMAP;
+                        tag.base_struct_pointer = 0;
+                        break;
+                    case TagClassInt::TAG_CLASS_SOUND:
+                        type = DataMapType::DATA_MAP_SOUND;
+                        tag.base_struct_pointer = ~static_cast<HEK::Pointer>(sizeof(HEK::Sound<LittleEndian>));
+                        break;
+                    default:
+                        type = DataMapType::DATA_MAP_LOC;
+                        tag.base_struct_pointer = 0;
+                        break;
+                }
+
+                // Next, check if we have that
+                if(type == DataMapType::DATA_MAP_BITMAP && this->bitmap_data_length == 0) {
+                    continue;
+                }
+                else if(type == DataMapType::DATA_MAP_SOUND && this->sound_data_length == 0) {
+                    continue;
+                }
+                else if(type == DataMapType::DATA_MAP_LOC && this->loc_data_length == 0) {
+                    continue;
+                }
+
+                // Let's begin.
+                auto &header = *reinterpret_cast<ResourceMapHeader *>(this->get_data_at_offset(0, sizeof(ResourceMapHeader), type));
+                auto count = header.resource_count.read();
+                auto *indices = reinterpret_cast<ResourceMapResource *>(this->get_data_at_offset(header.resources, count * sizeof(ResourceMapResource), type));
+                std::uint32_t resource_index = static_cast<std::uint32_t>(~0);
+
+                // Find that index
+                if(type == DataMapType::DATA_MAP_SOUND) {
+                    auto *paths = reinterpret_cast<const char *>(this->get_data_at_offset(header.paths, 0, type));
+                    for(std::uint32_t i = 1; i < count; i+=2) {
+                        auto *path = paths + indices[i].path_offset;
+                        if(tag.p_path == path) {
+                            resource_index = i;
+                            break;
+                        }
+                    }
+                }
+                else {
+                    resource_index = tags[i].tag_data;
+                }
+
+                // Make sure it's valid
+                if(resource_index >= count) {
+                    throw OutOfBoundsException();
+                }
+
+                // Set it all
+                auto &index = indices[resource_index];
+                tag.tag_data_size = index.size;
+                tag.base_struct_offset = index.data_offset;
             }
             else {
-                tag.p_data = this->resolve_tag_data_pointer(tags[i].tag_data);
-                std::size_t offset = tag.p_data - this->data;
-                tag.p_data_size = this->tag_data_length - offset;
-                tag.p_base_address = tags[i].tag_data;
+                tag.base_struct_pointer = tags[i].tag_data;
             }
         }
 
@@ -215,10 +276,11 @@ namespace Invader {
                 throw OutOfBoundsException();
             }
 
+            // Add the BSP stuff here
             auto &bsp_tag = this->tags[bsp_id];
-            bsp_tag.p_data_size = bsp.bsp_size;
-            bsp_tag.p_data = this->get_data_at_offset(bsp.bsp_start, bsp_tag.p_data_size);
-            bsp_tag.p_base_address = bsp.bsp_address;
+            bsp_tag.tag_data_size = bsp.bsp_size;
+            bsp_tag.base_struct_offset = bsp.bsp_start;
+            bsp_tag.base_struct_pointer = bsp.bsp_address;
         }
     }
 }

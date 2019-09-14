@@ -728,16 +728,18 @@ namespace Invader::HEK {
     static_assert(sizeof(ScenarioPlayerStartingLocation<BigEndian>) == 0x34);
 
     ENDIAN_TEMPLATE(EndianType) struct ScenarioTriggerVolume {
-        LittleEndian<std::uint16_t> unknown;
+        LittleEndian<std::uint16_t> unknown; // 1 = enabled? idk
         PAD(0x2);
         TagString name;
-        EndianType<float> values[15];
+        EndianType<float> unknown_values[9];
+        Point3D<EndianType> corners[2];
 
         ENDIAN_TEMPLATE(NewType) operator ScenarioTriggerVolume<NewType>() const noexcept {
             ScenarioTriggerVolume<NewType> copy = {};
             COPY_THIS(unknown);
             COPY_THIS(name);
-            COPY_THIS_ARRAY(values);
+            COPY_THIS_ARRAY(unknown_values);
+            COPY_THIS_ARRAY(corners);
             return copy;
         }
     };
@@ -1097,12 +1099,16 @@ namespace Invader::HEK {
     ENDIAN_TEMPLATE(EndianType) struct ScenarioFiringPosition {
         Point3D<EndianType> position;
         EndianType<ScenarioGroupIndex> group_index;
-        PAD(0xA);
+        LittleEndian<std::uint16_t> cluster_index;
+        PAD(0x4);
+        LittleEndian<std::uint32_t> surface_index;
 
         ENDIAN_TEMPLATE(NewType) operator ScenarioFiringPosition<NewType>() const noexcept {
             ScenarioFiringPosition<NewType> copy = {};
             COPY_THIS(position);
             COPY_THIS(group_index);
+            COPY_THIS(cluster_index);
+            COPY_THIS(surface_index);
             return copy;
         }
     };
@@ -1209,7 +1215,7 @@ namespace Invader::HEK {
         EndianType<ScenarioCommandListFlags> flags;
         PAD(0x8);
         EndianType<std::int16_t> manual_bsp_index;
-        EndianType<std::int16_t> unknown;
+        EndianType<std::int16_t> precomputed_bsp_index;
         TagReflexive<EndianType, ScenarioCommand> commands;
         TagReflexive<EndianType, ScenarioCommandPoint> points;
         PAD(0x18);
@@ -1219,7 +1225,7 @@ namespace Invader::HEK {
             COPY_THIS(name);
             COPY_THIS(flags);
             COPY_THIS(manual_bsp_index);
-            COPY_THIS(unknown);
+            COPY_THIS(precomputed_bsp_index);
             COPY_THIS(commands);
             COPY_THIS(points);
             return copy;

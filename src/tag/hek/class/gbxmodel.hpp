@@ -60,7 +60,7 @@ namespace Invader::HEK {
         EndianType<float> node_distance_from_parent;
         PAD(0x20);
         EndianType<float> scale;
-        Matrix<EndianType> matrix;
+        Matrix<EndianType> rotation;
         Point3D<EndianType> translation;
 
         ENDIAN_TEMPLATE(NewType) operator GBXModelNode<NewType>() const noexcept {
@@ -73,7 +73,7 @@ namespace Invader::HEK {
             COPY_THIS(default_rotation);
             COPY_THIS(node_distance_from_parent);
             COPY_THIS(scale);
-            COPY_THIS(matrix);
+            COPY_THIS(rotation);
             COPY_THIS(translation);
             return copy;
         }
@@ -254,7 +254,11 @@ namespace Invader::HEK {
         /** number of vertices when compiled */
         EndianType<std::uint32_t> vertex_count;
 
-        PAD(0x8);
+        /** actual padding */
+        PAD(0x4);
+
+        /** This value is complete and utter bullshit. Tool changes this arbitrarily, resulting in different values when built on different OS's, shells, etc. And it probably doesn't even do anything. */
+        BigEndian<std::uint32_t> bullshit;
 
         /** offset to vertices from beginning of vertices when compiled */
         EndianType<std::uint32_t> vertex_offset;
@@ -285,6 +289,7 @@ namespace Invader::HEK {
             COPY_THIS(triangle_offset_2);
             COPY_THIS(vertex_count);
             COPY_THIS(vertex_offset);
+            COPY_THIS(bullshit);
             COPY_THIS_ARRAY(local_node_indices);
             return copy;
         }

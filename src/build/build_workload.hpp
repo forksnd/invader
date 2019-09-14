@@ -26,7 +26,9 @@ namespace Invader {
          * @param maps_directory    maps directory to use
          * @param with_index        tag index to use
          * @param no_indexed_tags   do not use cached tags
+         * @param always_index_tags always use cached tags
          * @param verbose           output non-error messages to console
+         * @param forge_crc         forge the CRC32 of the map
          */
         static std::vector<std::byte> compile_map(
             const char *scenario,
@@ -34,7 +36,9 @@ namespace Invader {
             std::string maps_directory,
             const std::vector<std::tuple<HEK::TagClassInt, std::string>> &with_index = std::vector<std::tuple<Invader::HEK::TagClassInt, std::string>>(),
             bool no_indexed_tags = false,
-            bool verbose = false
+            bool always_index_tags = false,
+            bool verbose = false,
+            const std::uint32_t *forge_crc = nullptr
         );
 
     private:
@@ -57,6 +61,11 @@ namespace Invader {
          * Cache file type
          */
         HEK::CacheFileType cache_file_type = HEK::CacheFileType::CACHE_FILE_MULTIPLAYER;
+
+        /**
+         * Always index tags when possible
+         */
+        bool always_index_tags;
 
         /**
          * Maps directory to use
@@ -118,9 +127,10 @@ namespace Invader {
 
         /**
          * Build a cache file
+         * @param   forge_crc  forge the CRC32 of the map
          * @return  cache file data
          */
-        std::vector<std::byte> build_cache_file();
+        std::vector<std::byte> build_cache_file(const std::uint32_t *forge_crc = nullptr);
 
         /**
          * Index tags that can be indexed
@@ -172,14 +182,14 @@ namespace Invader {
         void add_model_tag_data(std::vector<std::byte> &vertices, std::vector<std::byte> &indices, std::vector<std::byte> &tag_data);
 
         /**
-         * Fix the scripts in the scenario tag
-         */
-        void fix_scenario_tag_scripts();
-
-        /**
          * Fix the encounters in the scenario tag
          */
         void fix_scenario_tag_encounters();
+
+        /**
+         * Fix the command lists in the scenario tag
+         */
+        void fix_scenario_tag_command_lists();
 
         /**
          * Check if the point is in the bsp
@@ -188,6 +198,23 @@ namespace Invader {
          * @return      true if point is inside the bsp
          */
         bool point_in_bsp(std::uint32_t bsp, const HEK::Point3D<HEK::LittleEndian> &point);
+
+        /**
+         * Get the leaf index for the point in BSP
+         * @param bsp   bsp index to check
+         * @param point point to check
+         * @return      leaf index or null if not in BSP
+         */
+        HEK::FlaggedInt<std::uint32_t> leaf_for_point_in_bsp(std::uint32_t bsp, const HEK::Point3D<HEK::LittleEndian> &point);
+
+        bool intersect_in_bsp(const HEK::Point3D<HEK::LittleEndian> &point_a, const HEK::Point3D<HEK::LittleEndian> &point_b, std::uint32_t bsp, HEK::Point3D<HEK::LittleEndian> &intersection_point, std::uint32_t &surface_index, std::uint32_t &leaf_index);
+
+        /**
+         * Get the tag index of the BSP
+         * @param  bsp bsp index
+         * @return     index of the BSP
+         */
+        std::size_t get_bsp_tag_index(std::uint32_t bsp);
     };
 }
 #endif

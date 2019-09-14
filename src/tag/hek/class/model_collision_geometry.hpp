@@ -111,23 +111,10 @@ namespace Invader::HEK {
     };
     static_assert(sizeof(ModelCollisionGeometrySphere<BigEndian>) == 0x20);
 
-    struct ModelCollisionGeometryBSPNodeIndex {
-        std::uint32_t index : 31;
-        std::uint32_t flag : 1;
-
-        inline operator std::uint32_t() const {
-            return this->index;
-        }
-
-        inline bool is_null() const {
-            return this->index == 0x7FFFFFFF && this->flag;
-        }
-    };
-
     ENDIAN_TEMPLATE(EndianType) struct ModelCollisionGeometryBSP3DNode {
         EndianType<std::int32_t> plane;
-        EndianType<ModelCollisionGeometryBSPNodeIndex> back_child;
-        EndianType<ModelCollisionGeometryBSPNodeIndex> front_child;
+        EndianType<FlaggedInt<std::uint32_t>> back_child;
+        EndianType<FlaggedInt<std::uint32_t>> front_child;
 
         ENDIAN_TEMPLATE(NewType) operator ModelCollisionGeometryBSP3DNode<NewType>() const noexcept {
             ModelCollisionGeometryBSP3DNode<NewType> copy = {};
@@ -170,8 +157,8 @@ namespace Invader::HEK {
     static_assert(sizeof(ModelCollisionGeometryLeaf<BigEndian>) == 0x8);
 
     ENDIAN_TEMPLATE(EndianType) struct ModelCollisionGeometryBSP2DReference {
-        EndianType<ModelCollisionGeometryBSPNodeIndex> plane;
-        EndianType<ModelCollisionGeometryBSPNodeIndex> bsp2d_node;
+        EndianType<FlaggedInt<std::uint32_t>> plane;
+        EndianType<FlaggedInt<std::uint32_t>> bsp2d_node;
 
         ENDIAN_TEMPLATE(NewType) operator ModelCollisionGeometryBSP2DReference<NewType>() const noexcept {
             ModelCollisionGeometryBSP2DReference<NewType> copy;
@@ -184,8 +171,8 @@ namespace Invader::HEK {
 
     ENDIAN_TEMPLATE(EndianType) struct ModelCollisionGeometryBSP2DNode {
         Plane2D<EndianType> plane;
-        EndianType<ModelCollisionGeometryBSPNodeIndex> left_child;
-        EndianType<ModelCollisionGeometryBSPNodeIndex> right_child;
+        EndianType<FlaggedInt<std::uint32_t>> left_child;
+        EndianType<FlaggedInt<std::uint32_t>> right_child;
 
         ENDIAN_TEMPLATE(NewType) operator ModelCollisionGeometryBSP2DNode<NewType>() const noexcept {
             ModelCollisionGeometryBSP2DNode<NewType> copy;
@@ -205,7 +192,7 @@ namespace Invader::HEK {
     };
 
     ENDIAN_TEMPLATE(EndianType) struct ModelCollisionGeometrySurface {
-        EndianType<ModelCollisionGeometryBSPNodeIndex> plane;
+        EndianType<FlaggedInt<std::uint32_t>> plane;
         EndianType<std::int32_t> first_edge;
         ModelCollisionGeometrySurfaceFlags flags;
         std::int8_t breakable_surface;
@@ -417,5 +404,47 @@ namespace Invader::HEK {
                                                       } ADD_REFLEXIVE_END;
 
     void compile_model_collision_geometry_tag(CompiledTag &compiled, const std::byte *data, std::size_t size);
+
+    /**
+     * Determine if a point is located inside of a BSP. If so, return the leaf.
+     * @param  point            3D point reference
+     * @param  bsp3d_nodes      pointer to the BSP3D nodes
+     * @param  bsp3d_node_count number of BSP3D nodes
+     * @param  planes           pointer to the BSP planes
+     * @param  plane_count      number of BSP planes
+     * @return                  leaf index if found; null index if not
+     */
+    FlaggedInt<std::uint32_t> leaf_for_point_of_bsp_tree(
+        const Point3D<LittleEndian> &point,
+        const ModelCollisionGeometryBSP3DNode<LittleEndian> *bsp3d_nodes,
+        std::uint32_t bsp3d_node_count,
+        const ModelCollisionGeometryPlane<LittleEndian> *planes,
+        std::uint32_t plane_count
+    );
+
+
+    bool check_for_intersection(
+        const Point3D<LittleEndian> &point_a,
+        const Point3D<LittleEndian> &point_b,
+        const ModelCollisionGeometryBSP3DNode<LittleEndian> *bsp3d_nodes,
+        std::uint32_t bsp3d_node_count,
+        const ModelCollisionGeometryPlane<LittleEndian> *planes,
+        std::uint32_t plane_count,
+        const ModelCollisionGeometryLeaf<LittleEndian> *leaves,
+        std::uint32_t leaf_count,
+        const ModelCollisionGeometryBSP2DNode<LittleEndian> *bsp2d_nodes,
+        std::uint32_t bsp2d_node_count,
+        const ModelCollisionGeometryBSP2DReference<LittleEndian> *bsp2d_references,
+        std::uint32_t bsp2d_reference_count,
+        const ModelCollisionGeometrySurface<LittleEndian> *surfaces,
+        std::uint32_t surface_count,
+        const ModelCollisionGeometryEdge<LittleEndian> *edges,
+        std::uint32_t edge_count,
+        const ModelCollisionGeometryVertex<LittleEndian> *vertices,
+        std::uint32_t vertex_count,
+        Point3D<LittleEndian> &intersection_point,
+        std::uint32_t &surface_index,
+        std::uint32_t &leaf_index
+    );
 }
 #endif

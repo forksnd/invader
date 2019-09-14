@@ -10,7 +10,6 @@
 #include <cstring>
 
 #include "../../eprintf.hpp"
-#include "../../version.hpp"
 #include "../../hek/data_type.hpp"
 #include "../../error.hpp"
 #include "../compiled_tag.hpp"
@@ -98,7 +97,7 @@ namespace Invader {
                                 std::copy(reinterpret_cast<std::byte *>(current_struct_address), reinterpret_cast<std::byte *>(current_struct_address + sizeof(reflexive)), compiled.data.data() + current_struct_offset); \
                             } \
                         }\
-                        catch(std::exception &e) {\
+                        catch(std::exception &) {\
                             eprintf("error adding reflexive #%zu for %s\n", i, struct_name); \
                             throw; \
                         }\

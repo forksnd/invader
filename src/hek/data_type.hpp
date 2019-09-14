@@ -9,11 +9,10 @@
 
 #include <string>
 #include <vector>
-
-#define _USE_MATH_DEFINES
 #include <cmath>
 
 #include "../error.hpp"
+#include "constants.hpp"
 #include "pad.hpp"
 #include "class_int.hpp"
 #include "endian.hpp"
@@ -30,14 +29,14 @@
  * @param  deg Degrees to convert from
  * @return     Radians
  */
-#define DEGREES_TO_RADIANS(deg) (deg * M_PI / 180.0)
+#define DEGREES_TO_RADIANS(deg) static_cast<float>(deg * HALO_PI / 180.0F)
 
 /**
  * Convert radians to degrees
  * @param  rad Radians to convert from
  * @return     Degrees
  */
-#define RADIANS_TO_DEGREES(rad) (rad * 180.0 / M_PI)
+#define RADIANS_TO_DEGREES(rad) static_cast<float>(rad * 180.0F / HALO_PI)
 
 namespace Invader::HEK {
     using Pointer = std::uint32_t;
@@ -82,15 +81,88 @@ namespace Invader::HEK {
      */
     struct TagString {
         char string[0x20] = {};
+    };
 
-        TagString() {}
-        TagString(const std::string &copy) {
-            if(copy.length() >= sizeof(string)) {
-                throw OutOfBoundsException();
-            }
-            std::strcpy(string, copy.data());
+    /**
+     * Unsigned integer that uses the high-order bit as a flag
+     */
+    template<typename T> struct FlaggedInt {
+        /**
+         * Raw value
+         */
+        T value;
+
+        static_assert(std::is_signed<T>() == false, "FlaggedInt takes an unsigned integer.");
+
+        /**
+         * Flag value
+         */
+        static constexpr T FLAG_BIT = (1 << (sizeof(T) * 8 - 1));
+
+        /**
+         * Maximum value of the integer
+         */
+        static constexpr T MAX_VALUE = FLAG_BIT - 1;
+
+        /**
+         * Create a null FlaggedInt
+         * @return null FlaggedInt
+         */
+        static inline FlaggedInt<T> null() {
+            return FlaggedInt<T> { (FLAG_BIT | MAX_VALUE) };
+        }
+
+        /**
+         * Return true if the flag is set
+         * @return true if flag is set
+         */
+        inline bool flag_value() const noexcept {
+            return this->value & FLAG_BIT;
+        }
+
+        /**
+         * Return true if this is a null value
+         * @return true if this is a null value
+         */
+        inline bool is_null() const noexcept {
+            return this->value == (FLAG_BIT | MAX_VALUE);
+        }
+
+        /**
+         * Get the value of the integer
+         * @return value of the integer
+         */
+        inline T int_value() const noexcept {
+            return this->value & MAX_VALUE;
+        }
+
+        /**
+         * Set the flag of the integer
+         * @param new_flag_value value of the flag to set
+         */
+        inline void set_flag(bool new_flag_value) noexcept {
+            this->value = this->int_value() | (FLAG_BIT * new_flag_value);
+        }
+
+        /**
+         * Set the flag of the integer
+         * @param new_int_value value of the integer to set
+         */
+        inline void set_value(T new_int_value) noexcept {
+            this->value = (new_int_value & MAX_VALUE) | (this->flag_value());
+        }
+
+        inline operator T() const noexcept {
+            return this->int_value();
+        }
+
+        inline bool operator ==(const FlaggedInt<T> &other) {
+            return this->value == other.value;
         }
     };
+    static_assert(sizeof(FlaggedInt<std::uint32_t>) == sizeof(std::uint32_t));
+    static_assert(FlaggedInt<std::uint32_t>::MAX_VALUE == 0x7FFFFFFF);
+    static_assert(FlaggedInt<std::uint32_t>::FLAG_BIT == 0x80000000);
 
     /**
      * Dependencies allow tags to reference other tags.
@@ -332,11 +404,39 @@ namespace Invader::HEK {
             return copy;
         }
 
+        Vector3D<EndianType> operator*(float multiply) const {
+            Vector3D<EndianType> copy;
+            copy.i = this->i * multiply;
+            copy.j = this->j * multiply;
+            copy.k = this->k * multiply;
+            return copy;
+        }
+
         Vector3D<EndianType> operator+(const Vector3D<EndianType> &add) const {
             Vector3D<EndianType> copy;
             copy.i = this->i + add.i;
             copy.j = this->j + add.j;
             copy.k = this->k + add.k;
+            return copy;
+        }
+
+        Vector3D<EndianType> normalize() const {
+            // First let's get the distance
+            float distance = std::sqrt(i*i + j*j + k*k);
+
+            // If it's 0, we can't normalize it
+            if(distance == 0.0F) {
+                return {};
+            }
+
+            // Find what we must multiply to get
+            float m_distance = 1.0F / distance;
+
+            // Now write and return the new values
+            Vector3D<EndianType> copy;
+            copy.i = i * m_distance;
+            copy.j = j * m_distance;
+            copy.k = k * m_distance;
             return copy;
         }
     };
@@ -425,7 +525,7 @@ namespace Invader::HEK {
          * @return     Distance in world units (positive if in front, negative if behind, zero if neither)
          */
         float distance_from_plane(const Plane2D<EndianType> &plane) const {
-            return ((plane.x * this->x) + (plane.y * this->y)) - plane.w;
+            return ((plane.vector.i * this->x) + (plane.vector.j * this->y)) - plane.w;
         }
     };
     static_assert(sizeof(Point2D<BigEndian>) == 0x8);
@@ -456,10 +556,30 @@ namespace Invader::HEK {
 
         Point3D<EndianType> operator+(const Point3D<EndianType> &add) const {
             Point3D<EndianType> copy;
-            copy.y = this->x + add.x;
-            copy.x = this->y + add.y;
+            copy.x = this->x + add.x;
+            copy.y = this->y + add.y;
             copy.z = this->z + add.z;
             return copy;
+        }
+
+        Point3D<EndianType> operator+(const Vector3D<EndianType> &add) const {
+            Point3D<EndianType> copy;
+            copy.x = this->x + add.i;
+            copy.y = this->y + add.j;
+            copy.z = this->z + add.k;
+            return copy;
+        }
+
+        Point3D<EndianType> operator+(float add) const {
+            Point3D<EndianType> copy;
+            copy.x = this->x + add;
+            copy.y = this->y + add;
+            copy.z = this->z + add;
+            return copy;
+        }
+
+        bool operator ==(const Point3D<EndianType> &other) const {
+            return this->x == other.x && this->y == other.y && this->z == other.z;
         }
 
         /**
@@ -467,8 +587,51 @@ namespace Invader::HEK {
          * @param  plane Plane to check
          * @return       Distance in world units (positive if in front, negative if behind, zero if neither)
          */
-        float distance_from_plane(const Plane3D<EndianType> &plane) const {
+        inline float distance_from_plane(const Plane3D<EndianType> &plane) const {
             return ((plane.vector.i * this->x) + (plane.vector.j * this->y) + (plane.vector.k * this->z)) - plane.w;
+        }
+
+        /**
+         * Get the distance from the plane
+         * @param plane Plane to check
+         * @return      distance from the plane in world units
+         */
+        inline float operator-(const Plane3D<EndianType> &plane) const {
+            return this->distance_from_plane(plane);
+        }
+
+        /**
+         * Calculate a non-normalized vector between two points
+         * @param point Other point to check
+         * @return      vector calculated
+         */
+        inline Vector3D<EndianType> operator-(const Point3D<EndianType> &point) const {
+            Vector3D<EndianType> v;
+            v.i = this->x - point.x;
+            v.j = this->y - point.y;
+            v.k = this->z - point.z;
+            return v;
+        }
+
+        /**
+         * Get the distance from the point squared. This is faster because no square root operation is used.
+         * @param  point Point to check
+         * @return       Distance in world units
+         */
+        inline float distance_from_point_squared(const Point3D<EndianType> &point) const {
+            float x = point.x - this->x;
+            float y = point.y - this->y;
+            float z = point.z - this->z;
+            return x*x + y*y + z*z;
+        }
+
+        /**
+         * Get the distance from the point.
+         * @param  point Point to check
+         * @return       Distance in world units
+         */
+        inline float distance_from_point(const Point3D<EndianType> &point) const {
+            return std::sqrt(this->distance_from_point_squared(point));
         }
 
         Point3D(const Vector3D<EndianType> &copy) : x(copy.i), y(copy.j), z(copy.k) {}
@@ -658,5 +821,14 @@ namespace Invader::HEK {
     Vector3D<NativeEndian> multiply_vector(const Vector3D<NativeEndian> &vector, float value) noexcept;
     Vector3D<NativeEndian> rotate_vector(const Vector3D<NativeEndian> &vector, const Quaternion<NativeEndian> &rotation) noexcept;
     Vector3D<NativeEndian> rotate_vector(const Vector3D<NativeEndian> &vector, const Matrix<NativeEndian> &rotation) noexcept;
+
+    bool intersect_plane_with_points(const Plane3D<NativeEndian> &plane, const Point3D<NativeEndian> &point_a, const Point3D<NativeEndian> &point_b, Point3D<NativeEndian> *intersection = nullptr, float epsilon = 0.0001);
+
+    inline float dot3(const Vector3D<NativeEndian> &vector_a, const Vector3D<NativeEndian> &vector_b) {
+        return (vector_a.i * vector_b.i) + (vector_a.j * vector_b.j) + (vector_a.k * vector_b.k);
+    }
+    inline float dot3(const Vector3D<NativeEndian> &vector_a, const Point3D<NativeEndian> &point_b) {
+        return (vector_a.i * point_b.x) + (vector_a.j * point_b.y) + (vector_a.k * point_b.z);
+    }
 }
 #endif

@@ -46,12 +46,15 @@ int main(int argc, char * const argv[]) {
     bool no_indexed_tags = false;
     bool handled = true;
     bool quiet = false;
+    bool always_index_tags = false;
+    const char *forged_crc = nullptr;
 
     int opt;
     int longindex = 0;
     static struct option options[] = {
         {"help",  no_argument, 0, 'h'},
         {"no-indexed-tags", no_argument, 0, 'n' },
+        {"always-index-tags", no_argument, 0, 'a' },
         {"quiet", no_argument, 0, 'q' },
         {"info", no_argument, 0, 'i' },
         {"game-engine",  required_argument, 0, 'g' },
@@ -59,11 +62,12 @@ int main(int argc, char * const argv[]) {
         {"maps", required_argument, 0, 'm' },
         {"tags", required_argument, 0, 't' },
         {"output", required_argument, 0, 'o' },
+        {"forge-crc", required_argument, 0, 'c' },
         {0, 0, 0, 0 }
     };
 
     // Go through every argument
-    while((opt = getopt_long(argc, argv, "nqhiw:m:t:o:g:", options, &longindex)) != -1) {
+    while((opt = getopt_long(argc, argv, "naqhiw:m:t:o:g:c:", options, &longindex)) != -1) {
         switch(opt) {
             case 'n':
                 no_indexed_tags = true;
@@ -83,6 +87,9 @@ int main(int argc, char * const argv[]) {
             case 'm':
                 maps = std::string(optarg);
                 break;
+            case 'a':
+                always_index_tags = true;
+                break;
             case 'g':
                 engine = std::string(optarg);
                 if(engine != "ce" && engine != "retail") {
@@ -94,37 +101,49 @@ int main(int argc, char * const argv[]) {
                     no_indexed_tags = true;
                 }
                 break;
+            case 'c':
+                forged_crc = optarg;
+                break;
             case 'i':
                 INVADER_SHOW_INFO
                 return EXIT_FAILURE;
-            case 'h':
-                eprintf("Usage: %s [options] <scenario>\n", argv[0]);
-                eprintf("Options:\n");
-                eprintf("  --game-engine <id>   Specify the game engine. Valid engines are: ce (default),\n");
-                eprintf("  -g                   retail\n\n");
-                eprintf("  --info               Show credits, source info, and other info.\n");
-                eprintf("  -i\n\n");
-                eprintf("  --maps <dir>         Use a specific maps directory.\n");
-                eprintf("  -m\n\n");
-                eprintf("  --no-indexed-tags    Do not index tags. This can speed up build time at the\n");
-                eprintf("  -n                   cost of a much larger file size.\n\n");
-                eprintf("  --output <file>      Output to a specific file.\n");
-                eprintf("  -o\n\n");
-                eprintf("  --quiet              Only output error messages.\n");
-                eprintf("  -q\n\n");
-                eprintf("  --tags <dir>         Use the specified tags directory. Use multiple times to\n");
-                eprintf("  -t                   add more directories, ordered by precedence.\n\n");
-                eprintf("  --with-index <file>  Use an index file for the tags, ensuring the map's tags\n");
-                eprintf("  -w                   are ordered in the same way.\n");
-                return EXIT_FAILURE;
             default:
+                eprintf("Usage: %s [options] <scenario>\n\n", argv[0]);
+                eprintf("Build cache files for Halo Custom Edition.\n\n");
+                eprintf("Options:\n");
+                eprintf("  --game-engine,-g <id>        Specify the game engine. Valid engines are: ce,\n");
+                eprintf("                               (default), retail\n");
+                eprintf("  --info,-i                    Show credits, source info, and other info.\n");
+                eprintf("  --maps,-m <dir>              Use a specific maps directory.\n");
+                eprintf("  --no-indexed-tags,-n         Do not index tags. This can speed up build time\n");
+                eprintf("                               at the cost of a much larger file size.\n");
+                eprintf("  --always-index-tags,-a       Always index tags when possible. This can speed\n");
+                eprintf("                               up build time, but stock tags can't be modified.\n");
+                eprintf("  --forge-crc,-c <crc>         Forge the CRC32 value of a map. This is useful\n");
+                eprintf("                               for multiplayer.\n");
+                eprintf("  --output,-o <file>           Output to a specific file.\n");
+                eprintf("  --quiet,-q                   Only output error messages.\n");
+                eprintf("  --tags,-t <dir>              Use the specified tags directory. Use multiple\n");
+                eprintf("                               times to add more directories, ordered by\n");
+                eprintf("                               precedence.\n");
+                eprintf("  --with-index,-w <file>       Use an index file for the tags, ensuring the\n");
+                eprintf("                               map's tags are ordered in the same way.\n\n");
                 return EXIT_FAILURE;
         }
     }
 
+    if(always_index_tags && no_indexed_tags) {
+        eprintf("%s: --no-index-tags conflicts with --always-index-tags.\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+
     // Check if there's a scenario tag
-    if(optind != argc - 1) {
+    if(optind == argc) {
         eprintf("%s: A scenario tag path is required. Use -h for help.\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+    else if(optind < argc - 1) {
+        eprintf("%s: Unexpected argument %s\n", argv[0], argv[optind + 1]);
         return EXIT_FAILURE;
     }
     else {
@@ -133,9 +152,7 @@ int main(int argc, char * const argv[]) {
 
     // If something is missing, let the user know
     if(!handled) {
-        #ifndef NO_OUTPUT
-        std::cerr << "Unhandled argument: " << last_argument << "\n";
-        #endif
+        eprintf("Unhandled argument: %s\n", last_argument.data());
         return RETURN_FAILED_UNHANDLED_ARGUMENT;
     }
 
@@ -173,7 +190,26 @@ int main(int argc, char * const argv[]) {
             }
         }
 
-        auto map = Invader::BuildWorkload::compile_map(scenario.data(), tags, maps, with_index, !no_indexed_tags, !quiet);
+        std::uint32_t forged_crc_value = 0;
+        std::uint32_t *forged_crc_ptr = nullptr;
+        if(forged_crc) {
+            std::size_t given_crc32_length = std::strlen(forged_crc);
+            if(given_crc32_length > 8 || given_crc32_length < 1) {
+                eprintf("Invalid CRC32 %s (must be 1-8 digits)\n", argv[2]);
+                return 1;
+            }
+            for(std::size_t i = 0; i < given_crc32_length; i++) {
+                char c = std::tolower(forged_crc[i]);
+                if(!(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f')) {
+                    eprintf("Invalid CRC32 %s (must be hexadecimal)\n", argv[2]);
+                    return 1;
+                }
+            }
+            forged_crc_value = std::strtoul(forged_crc, nullptr, 16);
+            forged_crc_ptr = &forged_crc_value;
+        }
+
+        auto map = Invader::BuildWorkload::compile_map(scenario.data(), tags, maps, with_index, no_indexed_tags, always_index_tags, !quiet, forged_crc_ptr);
 
         if(engine == "retail") {
             reinterpret_cast<Invader::HEK::CacheFileHeader *>(map.data())->engine = Invader::HEK::CACHE_FILE_RETAIL;
@@ -199,17 +235,13 @@ int main(int argc, char * const argv[]) {
 
         // Check if file is open
         if(!file) {
-            #ifndef NO_OUTPUT
-            std::cerr << "Failed to open " << final_file << " for writing.\n";
-            #endif
+            eprintf("Failed to open %s for writing.\n", final_file.data());
             return RETURN_FAILED_FILE_SAVE_ERROR;
         }
 
         // Write to file
         if(std::fwrite(map.data(), map.size(), 1, file) == 0) {
-            #ifndef NO_OUTPUT
-            std::cerr << "Failed to save.\n";
-            #endif
+            eprintf("Failed to save.\n");
             return RETURN_FAILED_FILE_SAVE_ERROR;
         }
 
@@ -224,10 +256,8 @@ int main(int argc, char * const argv[]) {
         return RETURN_OK;
     }
     catch(std::exception &exception) {
-        #ifndef NO_OUTPUT
-        std::cerr << "Failed to compile the map.\n";
-        std::cerr << exception.what() << "\n";
-        #endif
+        eprintf("Failed to compile the map.\n");
+        eprintf("%s\n", exception.what());
         return RETURN_FAILED_EXCEPTION_ERROR;
     }
 }
